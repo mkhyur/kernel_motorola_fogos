@@ -2083,7 +2083,8 @@ static inline void rx_msg_cleanup(struct usbpd *pd)
 static inline bool is_sink_tx_ok(struct usbpd *pd)
 {
 	if (pd->spec_rev == USBPD_REV_30)
-		return pd->typec_mode == QTI_POWER_SUPPLY_TYPEC_SOURCE_HIGH;
+		return pd->typec_mode == QTI_POWER_SUPPLY_TYPEC_SOURCE_HIGH |
+				pd->typec_mode == QTI_POWER_SUPPLY_TYPEC_SOURCE_MEDIUM;
 
 	return true;
 }
