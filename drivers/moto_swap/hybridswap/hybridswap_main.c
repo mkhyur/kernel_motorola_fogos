@@ -258,19 +258,30 @@ static void tune_scan_type_hook(void *data, char *scan_balance)
 static void tune_swappiness_hook(void *data, int *swappiness)
 {
 	if (current_is_kswapd()) {
-		*swappiness = *swappiness;
-#ifdef CONFIG_HYBRIDSWAP_SWAPD
-	} else if (current_is_mswapd()) {
-		*swappiness = 200;
-		if (free_swap_is_low()) {
-			*swappiness = 0;
-		}
-#endif
-	} else {
-		*swappiness = 60;
+		/* kswapd: use /proc/sys/vm/swappiness */
+		*swappiness = vm_swappiness;
+		return;
 	}
 
-	return;
+#ifdef CONFIG_HYBRIDSWAP_SWAPD
+	if (current_is_mswapd()) {
+		/*
+		 * mswapd: use /proc/sys/vm/swappiness. The tune_scan_type
+		 * hook already forces SCAN_ANON for mswapd, so no need
+		 * to override swappiness. Hardcoding 200 would set
+		 * file_prio=0 (200-200), starving the page cache.
+		 */
+		if (free_swap_is_low()) {
+			*swappiness = 0;
+			return;
+		}
+		*swappiness = vm_swappiness;
+		return;
+	}
+#endif
+
+	/* direct reclaim: use /proc/sys/vm/swappiness */
+	*swappiness = vm_swappiness;
 }
 
 static void mem_cgroup_alloc_hook(void *data, struct mem_cgroup *memcg)

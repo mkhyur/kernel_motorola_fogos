@@ -37,7 +37,8 @@ static void zcomp_strm_free(struct zcomp_strm *zstrm)
 {
 	if (!IS_ERR_OR_NULL(zstrm->tfm))
 		crypto_free_comp(zstrm->tfm);
-	free_pages((unsigned long)zstrm->buffer, 1);
+	if (zstrm->buffer)
+		free_pages((unsigned long)zstrm->buffer, 1);
 	zstrm->tfm = NULL;
 	zstrm->buffer = NULL;
 }

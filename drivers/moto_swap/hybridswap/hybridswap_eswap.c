@@ -567,7 +567,7 @@ ssize_t hybridswap_report_show(struct device *dev,
 	return hybridswap_fail_record_show(buf);
 }
 
-static inline meminfo_show(struct hybstatus *stat, char *buf, ssize_t len)
+static inline ssize_t meminfo_show(struct hybstatus *stat, char *buf, ssize_t len)
 {
 	unsigned long eswap_total_pages = 0, eswap_compressed_pages = 0;
 	unsigned long eswap_used_pages = 0;
@@ -2140,10 +2140,11 @@ static void eswap_clear(struct zram *zram, int eswapid)
 		return;
 	}
 
-	index = kzalloc(sizeof(int) * ESWAP_MAX_OBJ_CNT, GFP_ATOMIC);
-	if (!index)
-		index = kzalloc(sizeof(int) * ESWAP_MAX_OBJ_CNT,
-				GFP_ATOMIC | __GFP_NOFAIL);
+	index = kzalloc(sizeof(int) * ESWAP_MAX_OBJ_CNT, GFP_KERNEL);
+	if (!index) {
+		hybp(HYB_ERR, "Failed to allocate index array\n");
+		return;
+	}
 
 	cnt = swap_maps_fetch_eswap_index(zram->infos, eswapid, index);
 
@@ -4278,6 +4279,7 @@ static int hybridswap_core_init(struct zram *zram)
 	if (unlikely(ret)) {
 		hybp(HYB_ERR, "bind storage device failed! %d\n", ret);
 		hybridswap_global_setting_deinit();
+		return ret;
 	}
 
 	return 0;
@@ -4338,9 +4340,12 @@ ssize_t hybridswap_core_enable_store(struct device *dev,
 ssize_t hybridswap_core_enable_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
-	int len = snprintf(buf, PAGE_SIZE, "hybridswap %s out_to_eswap %s\n",
+	ssize_t len = snprintf(buf, PAGE_SIZE, "hybridswap %s out_to_eswap %s\n",
 			hybridswap_core_enabled() ? "enable" : "disable",
 			hybridswap_out_to_eswap_enable() ? "enable" : "disable");
+
+	if (len >= PAGE_SIZE)
+		len = PAGE_SIZE - 1;
 
 	return len;
 }
@@ -4368,12 +4373,14 @@ ssize_t hybridswap_loop_device_store(struct device *dev,
 	}
 
 	ret = hybridswap_core_init(zram);
-	if (ret)
-		hybp(HYB_ERR, "hybridswap_core_init init failed\n");
+	if (ret) {
+		hybp(HYB_ERR, "hybridswap_core_init failed, ret=%d\n", ret);
+		goto out;
+	}
 
 out:
 	up_write(&zram->init_lock);
-	return len;
+	return ret ? ret : len;
 }
 
 ssize_t hybridswap_loop_device_show(struct device *dev,

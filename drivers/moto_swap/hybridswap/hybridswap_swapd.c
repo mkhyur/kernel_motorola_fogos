@@ -118,72 +118,72 @@ extern unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
 		gfp_t gfp_mask,
 		bool may_swap);
 
-inline u64 fetch_zram_wm_scale_value(void)
+static inline u64 fetch_zram_wm_scale_value(void)
 {
 	return atomic64_read(&zram_wm_scale);
 }
 
-inline u64 fetch_compress_scale_value(void)
+static inline u64 fetch_compress_scale_value(void)
 {
 	return atomic64_read(&compress_scale);
 }
 
-inline unsigned int fetch_usable_mem_value(void)
+static inline unsigned int fetch_usable_mem_value(void)
 {
 	return atomic_read(&usable_mem);
 }
 
-inline unsigned int fetch_min_mem_watermark_value(void)
+static inline unsigned int fetch_min_mem_watermark_value(void)
 {
 	return atomic_read(&min_mem_watermark);
 }
 
-inline unsigned int fetch_high_mem_watermark_value(void)
+static inline unsigned int fetch_high_mem_watermark_value(void)
 {
 	return atomic_read(&high_mem_watermark);
 }
 
-inline u64 fetch_swapd_max_reclaim_size(void)
+static inline u64 fetch_swapd_max_reclaim_size(void)
 {
 	return atomic_read(&max_reclaim_size);
 }
 
-inline u64 fetch_free_swap_level_value(void)
+static inline u64 fetch_free_swap_level_value(void)
 {
 	return atomic64_read(&free_swap_level);
 }
 
-inline unsigned long long fetch_infos_pagefault_level_value(void)
+static inline unsigned long long fetch_infos_pagefault_level_value(void)
 {
 	return atomic64_read(&infos_pagefault_level);
 }
 
-inline unsigned long fetch_pagefault_refresh_min_value(void)
+static inline unsigned long fetch_pagefault_refresh_min_value(void)
 {
 	return atomic64_read(&pagefault_refresh_min);
 }
 
-inline unsigned long long fetch_nothing_ignore_skip_interval_value(void)
+static inline unsigned long long fetch_nothing_ignore_skip_interval_value(void)
 {
 	return atomic64_read(&nothing_ignore_skip_interval);
 }
 
-inline unsigned long long fetch_max_skip_interval_value(void)
+static inline unsigned long long fetch_max_skip_interval_value(void)
 {
 	return atomic64_read(&max_skip_interval);
 }
 
-inline unsigned long long fetch_nothing_ignore_check_level_value(void)
+static inline unsigned long long fetch_nothing_ignore_check_level_value(void)
 {
 	return atomic64_read(&nothing_ignore_check_level);
 }
 
-inline u64 fetch_zram_critical_level_value(void)
+static inline u64 fetch_zram_critical_level_value(void)
 {
 	return atomic64_read(&zram_crit_thres);
 }
 
-inline u64 fetch_cpuload_level_value(void)
+static inline u64 fetch_cpuload_level_value(void)
 {
 	return atomic64_read(&cpuload_level);
 }
@@ -1660,7 +1660,9 @@ int swapd_run(int nid)
 		return ret;
 	}
 
-	sched_setscheduler_nocheck(hyb_task->swapd, SCHED_NORMAL, &param);
+	ret = sched_setscheduler_nocheck(hyb_task->swapd, SCHED_NORMAL, &param);
+	if (ret)
+		hybp(HYB_ERR, "sched_setscheduler failed, ret=%d\n", ret);
 	set_user_nice(hyb_task->swapd, PRIO_TO_NICE(param.sched_priority));
 	wake_up_process(hyb_task->swapd);
 
@@ -1724,13 +1726,6 @@ static int swapd_cpu_online(unsigned int cpu)
 			set_cpus_allowed_ptr(PGDAT_ITEM(pgdat, swapd), mask);
 	}
 	return 0;
-}
-
-void alloc_pages_slowpath_hook(void *data, gfp_t gfp_flags,
-		unsigned int order, unsigned long delta)
-{
-	if (gfp_flags & __GFP_KSWAPD_RECLAIM)
-		wake_all_swapd();
 }
 
 void rmqueue_hook(void *data, struct zone *preferred_zone,

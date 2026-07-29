@@ -192,7 +192,6 @@ obj-$(CONFIG_MOTO_FOGOS_MODULES) += mmi_annotate/
 obj-$(CONFIG_MOTO_FOGOS_MODULES) += mmi_info/
 obj-$(CONFIG_MOTO_FOGOS_MODULES) += mmi_relay/
 obj-$(CONFIG_MOTO_FOGOS_MODULES) += moto_f_usbnet/
-obj-$(CONFIG_MOTO_FOGOS_MODULES) += moto_mm/
 obj-$(CONFIG_MOTO_FOGOS_MODULES) += moto_swap/
 obj-$(CONFIG_MOTO_FOGOS_MODULES) += sensors/
 obj-$(CONFIG_MOTO_FOGOS_MODULES) += watchdogtest/

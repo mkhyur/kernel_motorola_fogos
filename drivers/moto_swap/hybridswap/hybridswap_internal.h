@@ -489,11 +489,6 @@ static inline unsigned long long hybridswap_read_mcg_stats(
 	return 0;
 }
 
-unsigned long long hybridswap_fetch_zram_pagefault(void)
-{
-	return 0;
-}
-
 static inline unsigned long long hybridswap_fetch_zram_pagefault(void)
 {
 	return 0;
@@ -514,8 +509,6 @@ extern atomic_long_t page_fault_pause_cnt;
 extern struct cftype mem_cgroup_swapd_legacy_files[];
 extern bool zram_watermark_ok(void);
 extern void wake_all_swapd(void);
-extern void alloc_pages_slowpath_hook(void *data, gfp_t gfp_mask,
-        unsigned int order, unsigned long delta);
 extern void rmqueue_hook(void *data, struct zone *preferred_zone,
 	struct zone *zone, unsigned int order, gfp_t gfp_flags,
 	unsigned int alloc_flags, int migratetype);
