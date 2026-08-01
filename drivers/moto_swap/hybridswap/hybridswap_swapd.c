@@ -1468,7 +1468,7 @@ static unsigned long swapd_shrink_anon(pg_data_t *pgdat,
         if (reclaim_pages_this_cycle <= 0) break;
 
 		while ((memcg = fetch_next_memcg(memcg))) {
-			unsigned long memcg_nr_reclaimed, memcg_to_reclaim;
+			unsigned long memcg_nr_reclaimed = 0, memcg_to_reclaim;
 			memcg_hybs_t *hybs;
 
 			if (high_buffer_is_suitable() || atomic_read(&swapd_pause)) {
