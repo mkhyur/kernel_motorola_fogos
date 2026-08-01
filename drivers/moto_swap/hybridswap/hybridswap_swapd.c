@@ -1639,7 +1639,9 @@ do_eswap:
 	return 0;
 }
 
-int swapd_run(int nid)
+static DEFINE_MUTEX(swapd_lock);
+
+static int swapd_run_locked(int nid)
 {
 	pg_data_t *pgdat = NODE_DATA(nid);
 	struct sched_param param = {
@@ -1669,7 +1671,17 @@ int swapd_run(int nid)
 	return 0;
 }
 
-void swapd_stop(int nid)
+int swapd_run(int nid)
+{
+	int ret;
+
+	mutex_lock(&swapd_lock);
+	ret = swapd_run_locked(nid);
+	mutex_unlock(&swapd_lock);
+	return ret;
+}
+
+static void swapd_stop_locked(int nid)
 {
 	struct pglist_data *pgdata = NODE_DATA(nid);
 	struct task_struct *swapd;
@@ -1690,6 +1702,13 @@ void swapd_stop(int nid)
 	}
 
 	swapid = -1;
+}
+
+void swapd_stop(int nid)
+{
+	mutex_lock(&swapd_lock);
+	swapd_stop_locked(nid);
+	mutex_unlock(&swapd_lock);
 }
 
 static int mem_hotplug_swapd_notifier(struct notifier_block *nb,
@@ -1714,17 +1733,21 @@ static int swapd_cpu_online(unsigned int cpu)
 {
 	int nid;
 
+	mutex_lock(&swapd_lock);
 	for_each_node_state(nid, N_MEMORY) {
 		pg_data_t *pgdat = NODE_DATA(nid);
 		struct hybridswapd_task* hyb_task;
 		struct cpumask *mask;
 
 		hyb_task = PGDAT_ITEM_DATA(pgdat);
+		if (!hyb_task || !hyb_task->swapd)
+			continue;
 		mask = &hyb_task->swapd_bind_cpumask;
 
 		if (cpumask_any_and(cpu_online_mask, mask) < nr_cpu_ids)
 			set_cpus_allowed_ptr(PGDAT_ITEM(pgdat, swapd), mask);
 	}
+	mutex_unlock(&swapd_lock);
 	return 0;
 }
 
@@ -1743,6 +1766,7 @@ static int create_swapd_thread(struct zram *zram)
 	struct pglist_data *pgdat;
 	struct hybridswapd_task *tsk_info;
 
+	mutex_lock(&swapd_lock);
 	for_each_node(nid) {
 		pgdat = NODE_DATA(nid);
 		if (!PGDAT_ITEM_DATA(pgdat)) {
@@ -1760,14 +1784,16 @@ static int create_swapd_thread(struct zram *zram)
 	}
 
 	for_each_node_state(nid, N_MEMORY) {
-		if (swapd_run(nid))
+		if (swapd_run_locked(nid))
 			goto error_out;
 	}
+	mutex_unlock(&swapd_lock);
 
 	ret = cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN,
 			"mm/swapd:online", swapd_cpu_online, NULL);
 	if (ret < 0) {
 		hybp(HYB_ERR, "swapd: failed to register hotplug callbacks.\n");
+		mutex_lock(&swapd_lock);
 		goto error_out;
 	}
 	swapd_online = ret;
@@ -1789,6 +1815,7 @@ error_out:
 		kfree((void*)PGDAT_ITEM_DATA(pgdat));
 		pgdat->android_oem_data1 = 0;
 	}
+	mutex_unlock(&swapd_lock);
 
 	return -ENOMEM;
 }
@@ -1799,15 +1826,17 @@ static void destroy_swapd_thread(void)
 	struct pglist_data *pgdat;
 
 	cpuhp_remove_state_nocalls(swapd_online);
+	mutex_lock(&swapd_lock);
 	for_each_node(nid) {
 		pgdat = NODE_DATA(nid);
 		if (!PGDAT_ITEM_DATA(pgdat))
 			continue;
 
-		swapd_stop(nid);
+		swapd_stop_locked(nid);
 		kfree((void*)PGDAT_ITEM_DATA(pgdat));
 		pgdat->android_oem_data1 = 0;
 	}
+	mutex_unlock(&swapd_lock);
 }
 
 ssize_t hybridswap_swapd_pause_store(struct device *dev,
@@ -1880,9 +1909,9 @@ refresh_daemonfail:
 
 void swapd_exit(void)
 {
+	unregister_memory_notifier(&swapd_notifier_nb);
 	destroy_swapd_thread();
 	refresh_daemonexit();
-	unregister_memory_notifier(&swapd_notifier_nb);
 	atomic_set(&swapd_enabled, 0);
 }
 
