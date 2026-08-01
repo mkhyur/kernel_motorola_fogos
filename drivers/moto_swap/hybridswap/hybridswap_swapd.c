@@ -1837,10 +1837,7 @@ error_out:
 		if (!PGDAT_ITEM_DATA(pgdat))
 			continue;
 
-		if (PGDAT_ITEM(pgdat, swapd)) {
-			kthread_stop(PGDAT_ITEM(pgdat, swapd));
-			PGDAT_ITEM(pgdat, swapd) = NULL;
-		}
+		swapd_stop_locked(nid);
 
 		kfree((void*)PGDAT_ITEM_DATA(pgdat));
 		pgdat->android_oem_data1 = 0;
