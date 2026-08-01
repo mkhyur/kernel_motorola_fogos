@@ -179,6 +179,12 @@ static void mnt_free_id(struct mount *mnt)
 	if (likely(mnt->mnt.susfs_mnt_id_backup)) {
 		// If mnt->mnt.susfs_mnt_id_backup is not zero, it means mnt->mnt_id is spoofed,
 		// so here we return the original mnt_id for being freed.
+		// Note that for zygote cloned sus mounts the backup id itself is a sus mnt_id
+		// allocated from susfs_mnt_id_ida, so it must be freed back to the same ida.
+		if (unlikely(mnt->mnt.susfs_mnt_id_backup >= DEFAULT_SUS_MNT_ID)) {
+			ida_free(&susfs_mnt_id_ida, mnt->mnt.susfs_mnt_id_backup);
+			return;
+		}
 		ida_free(&mnt_id_ida, mnt->mnt.susfs_mnt_id_backup);
 		return;
 	}
