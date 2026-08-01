@@ -5312,6 +5312,11 @@ static int hybridswap_page_fault_fetch_eswap(struct zram *zram,
 			// Moto: waited enough, exit with EIO.
 			if (wait_cycle > 100000) {
 				hybp(HYB_ERR, "waited 100000 cycles in page fault, exit with EIO!\n");
+#ifdef CONFIG_HYBRIDSWAP_SWAPD
+				if (wait_cycle >= 1000)
+					atomic_long_dec(&page_fault_pause);
+#endif
+				hybridswap_free(iowork->ioentry);
 				return -EIO;
 			}
 
@@ -5333,10 +5338,12 @@ static int hybridswap_page_fault_fetch_eswap(struct zram *zram,
 		atomic_long_dec(&page_fault_pause);
 #endif
 	if (iowork->ioentry->eswapid < 0) {
-		hybstatus_alloc_fail(HYB_FAULT_OUT,
-				iowork->ioentry->eswapid);
+		int err = iowork->ioentry->eswapid;
 
-		return iowork->ioentry->eswapid;
+		hybstatus_alloc_fail(HYB_FAULT_OUT, err);
+		hybridswap_free(iowork->ioentry);
+
+		return err;
 	}
 	hybridswap_fault2_stat(zram, index);
 	hybridswap_fill_entry(iowork->ioentry, &iowork->io_buf,
