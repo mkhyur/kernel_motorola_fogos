@@ -201,7 +201,7 @@ memcg_hybs_t *hybridswap_cache_alloc(struct mem_cgroup *memcg, bool atomic)
 	gfp_t flags = GFP_KERNEL;
 
 	if (MEMCG_OEM_DATA(memcg))
-		BUG();
+		return (memcg_hybs_t *)MEMCG_OEM_DATA(memcg);
 
 	if (atomic)
 		flags &= ~__GFP_DIRECT_RECLAIM;
@@ -286,8 +286,8 @@ static void tune_swappiness_hook(void *data, int *swappiness)
 
 static void mem_cgroup_alloc_hook(void *data, struct mem_cgroup *memcg)
 {
-	if (MEMCG_OEM_DATA(memcg))
-		BUG();
+	if (WARN_ON_ONCE(MEMCG_OEM_DATA(memcg)))
+		return;
 
 	hybridswap_cache_alloc(memcg, true);
 }
