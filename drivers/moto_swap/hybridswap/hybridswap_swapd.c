@@ -1262,7 +1262,8 @@ bool zram_watermark_ok(void)
 	diff_buffers = diff_buffers * percent_constant / fetch_nr_zram_total();
 
 	cur_scale = zram_used * percent_constant / fetch_nr_zram_total();
-	wm  = min(fetch_zram_wm_scale_value(), fetch_zram_wm_scale_value()- diff_buffers);
+	wm  = min((long long)fetch_zram_wm_scale_value(),
+		  (long long)fetch_zram_wm_scale_value() - diff_buffers);
 
 	return cur_scale > wm;
 }
