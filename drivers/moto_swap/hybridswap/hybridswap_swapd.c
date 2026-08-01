@@ -1254,8 +1254,8 @@ bool zram_watermark_ok(void)
 	unsigned long zram_used = hybridswap_fetch_zram_used_pages();
 	const unsigned int percent_constant = 100;
 
-	diff_buffers = fetch_high_mem_watermark_value() -
-		system_cur_usable_mem();
+	diff_buffers = (long long)fetch_high_mem_watermark_value() -
+		(long long)system_cur_usable_mem();
 	diff_buffers *= SZ_1M / PAGE_SIZE;
 	diff_buffers *= fetch_compress_scale_value() / 10;
 	diff_buffers = diff_buffers * percent_constant / fetch_nr_zram_total();
