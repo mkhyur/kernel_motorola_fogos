@@ -4487,12 +4487,14 @@ void susfs_run_try_umount_for_current_mnt_ns(void) {
 	mnt_ns = current->nsproxy->mnt_ns;
 	// Lock the namespace
 	namespace_lock();
+	lock_mount_hash();
 	list_for_each_entry(mnt, &mnt_ns->list, mnt_list) {
 		// Change the sus mount to be private
 		if (mnt->mnt_id >= DEFAULT_SUS_MNT_ID) {
 			change_mnt_propagation(mnt, MS_PRIVATE);
 		}
 	}
+	unlock_mount_hash();
 	// Unlock the namespace
 	namespace_unlock();
 	susfs_try_umount_all(current_uid().val);
