@@ -4470,6 +4470,9 @@ ssize_t hybridswap_zram_increase_store(struct device *dev,
 	if (kstrtoul(type_buf, 0, &val))
 		return -EINVAL;
 
+	if (val > (zram->disksize >> (PAGE_SHIFT + 8)))
+		return -EINVAL;
+
 	zram->increase_nr_pages = (val << 8);
 	return len;
 }

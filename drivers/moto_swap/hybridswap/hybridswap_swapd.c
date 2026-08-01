@@ -195,6 +195,7 @@ static ssize_t usable_mem_params_write(struct kernfs_open_file *of,
 	unsigned int min_mem_watermark_value;
 	unsigned int high_mem_watermark_value;
 	u64 free_swap_level_value;
+	u64 max_mb;
 
 	buf = strstrip(buf);
 
@@ -203,6 +204,13 @@ static ssize_t usable_mem_params_write(struct kernfs_open_file *of,
 				&min_mem_watermark_value,
 				&high_mem_watermark_value,
 				&free_swap_level_value) != 4)
+		return -EINVAL;
+
+	max_mb = totalram_pages() >> (20 - PAGE_SHIFT);
+	if (usable_mem_value > max_mb ||
+			min_mem_watermark_value > max_mb ||
+			high_mem_watermark_value > max_mb ||
+			free_swap_level_value > max_mb)
 		return -EINVAL;
 
 	atomic_set(&usable_mem, usable_mem_value);
@@ -865,6 +873,9 @@ static s64 reclaim_exceed_sleep_ms_read(
 static int max_reclaimin_size_mb_write(
 		struct cgroup_subsys_state *css, struct cftype *cft, u64 val)
 {
+	if (val > (totalram_pages() >> (20 - PAGE_SHIFT)))
+		return -EINVAL;
+
 	max_reclaimin_size = (val << 20);
 
 	return 0;
