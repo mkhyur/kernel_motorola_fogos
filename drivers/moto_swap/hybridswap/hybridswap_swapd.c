@@ -95,6 +95,7 @@ static atomic_t refresh_daemonwait_flag;
 static atomic_t refresh_daemoninit_flag = ATOMIC_LONG_INIT(0);
 static struct task_struct *refresh_daemontask;
 static DEFINE_MUTEX(lowmem_event_lock);
+static DEFINE_MUTEX(swapd_lock);
 static pid_t swapid = -1;
 static unsigned long long infos_last_anon_pagefault;
 static unsigned long last_refresh_t;
@@ -982,6 +983,7 @@ static ssize_t swapd_bind_write(struct kernfs_open_file *of, char *buf,
 	struct pglist_data *pgdat;
 
 	buf = strstrip(buf);
+	mutex_lock(&swapd_lock);
 	for_each_node_state(nid, N_MEMORY) {
 		pgdat = NODE_DATA(nid);
 		if (!PGDAT_ITEM_DATA(pgdat))
@@ -994,6 +996,7 @@ static ssize_t swapd_bind_write(struct kernfs_open_file *of, char *buf,
 				break;
 		}
 	}
+	mutex_unlock(&swapd_lock);
 
 	if (ret)
 		return ret;
@@ -1008,6 +1011,7 @@ static int swapd_bind_read(struct seq_file *m, void *v)
 	struct hybridswapd_task* hyb_task;
 
 	seq_printf(m, "%4s %s\n", "Node", "mask");
+	mutex_lock(&swapd_lock);
 	for_each_node_state(nid, N_MEMORY) {
 		pgdat = NODE_DATA(nid);
 		hyb_task = PGDAT_ITEM_DATA(pgdat);
@@ -1019,6 +1023,7 @@ static int swapd_bind_read(struct seq_file *m, void *v)
 		seq_printf(m, "%4d %*pbl\n", nid,
 				cpumask_pr_args(&hyb_task->swapd_bind_cpumask));
 	}
+	mutex_unlock(&swapd_lock);
 
 	return 0;
 }
@@ -1669,8 +1674,6 @@ do_eswap:
 
 	return 0;
 }
-
-static DEFINE_MUTEX(swapd_lock);
 
 static int swapd_run_locked(int nid)
 {
