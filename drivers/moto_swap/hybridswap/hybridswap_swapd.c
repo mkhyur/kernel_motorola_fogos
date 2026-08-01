@@ -1499,18 +1499,18 @@ static unsigned long swapd_shrink_anon(pg_data_t *pgdat,
 
 			if (hybs->can_reclaimed < 0 || memcg_nr_reclaimed == 0) // no pages can be reclaimed, skip it.
 				hybs->can_reclaimed = 0;
-
-			if (swapd_nap_jiffies && time_after_eq(jiffies, start_js + swapd_nap_jiffies)) {
-				set_current_state(TASK_INTERRUPTIBLE);
-				schedule_timeout(msecs_to_jiffies(100));
-				start_js = jiffies;
-			}
 		}
 		if (exit)
 			break;
 
 		if (zram_is_low())
 			break;
+
+		if (swapd_nap_jiffies && time_after_eq(jiffies, start_js + swapd_nap_jiffies)) {
+			set_current_state(TASK_INTERRUPTIBLE);
+			schedule_timeout(msecs_to_jiffies(100));
+			start_js = jiffies;
+		}
 		reclaim_cycles--;
 	}
 
