@@ -740,16 +740,6 @@ unsigned int system_cur_usable_mem(void)
 	return buffers >> 8; /* pages to MB */
 }
 
-static bool min_buffer_is_suitable(void)
-{
-	u32 curr_buffers = system_cur_usable_mem();
-
-	if (curr_buffers >= fetch_min_mem_watermark_value())
-		return true;
-
-	return false;
-}
-
 bool high_buffer_is_suitable(void)
 {
 	u32 curr_buffers = system_cur_usable_mem();
@@ -1325,7 +1315,23 @@ bool zram_watermark_exceed(void)
 	return false;
 }
 
-static void wakeup_swapd(pg_data_t *pgdat)
+static bool wakeup_swapd_eligible(pg_data_t *pgdat)
+{
+	struct hybridswapd_task* hyb_task = PGDAT_ITEM_DATA(pgdat);
+
+	if (!hyb_task || !hyb_task->swapd)
+		return false;
+
+	if (atomic_read(&swapd_pause))
+		return false;
+
+	if (!waitqueue_active(&hyb_task->swapd_wait))
+		return false;
+
+	return true;
+}
+
+static void wakeup_swapd(pg_data_t *pgdat, u32 curr_buffers)
 {
 	unsigned long curr_interval;
 	struct hybridswapd_task* hyb_task = PGDAT_ITEM_DATA(pgdat);
@@ -1344,7 +1350,7 @@ static void wakeup_swapd(pg_data_t *pgdat)
 	if (atomic_read(&refresh_daemoninit_flag) == 1)
 		wakeup_refresh_daemon();
 
-	if (min_buffer_is_suitable()) {
+	if (curr_buffers >= fetch_min_mem_watermark_value()) {
 		count_swapd_event(SWAPD_OVER_MIN_BUFFER_SKIP_TIMES);
 		return;
 	}
@@ -1363,10 +1369,23 @@ void wake_all_swapd(void)
 {
 	pg_data_t *pgdat = NULL;
 	int nid;
+	u32 curr_buffers = 0;
+	bool eligible = false;
 
 	for_each_online_node(nid) {
+		if (wakeup_swapd_eligible(NODE_DATA(nid))) {
+			eligible = true;
+			break;
+		}
+	}
+
+	if (!eligible)
+		return;
+
+	curr_buffers = system_cur_usable_mem();
+	for_each_online_node(nid) {
 		pgdat = NODE_DATA(nid);
-		wakeup_swapd(pgdat);
+		wakeup_swapd(pgdat, curr_buffers);
 	}
 }
 
