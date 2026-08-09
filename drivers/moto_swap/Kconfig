@@ -107,3 +107,9 @@ config HYBRIDSWAP_CORE
 	  If unsure, say N here.
 	  This module can't be compiled as a module,
 	  the module is as one part of the ZRAM driver.
+
+# Compatibility alias so userspace/kernel-manager apps that probe
+# CONFIG_ZRAM see zram enabled; the real driver is HYBRIDSWAP_ZRAM.
+config ZRAM
+	bool "Legacy alias for hybridswap zram"
+	default y if HYBRIDSWAP_ZRAM

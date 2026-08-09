@@ -25,11 +25,13 @@ ifneq ($(filter m y,$(CONFIG_HYBRIDSWAP_CORE)),)
 EXTRA_CFLAGS += -DCONFIG_HYBRIDSWAP_CORE
 endif
 
-moto_swap-objs += $(ZRAM_SRC)/zram_drv.o
-moto_swap-objs += hybridswap/hybridswap_main.o
-moto_swap-objs += hybridswap/hybridswap_eswap.o
+zram-objs += $(ZRAM_SRC)/zram_drv.o
+zram-objs += hybridswap/hybridswap_main.o
+zram-objs += hybridswap/hybridswap_eswap.o
 
-moto_swap-objs += hybridswap/hybridswap_swapd.o
-moto_swap-objs += $(ZRAM_SRC)/zcomp.o
+zram-objs += hybridswap/hybridswap_swapd.o
+zram-objs += $(ZRAM_SRC)/zcomp.o
 
-obj-$(CONFIG_HYBRIDSWAP_ZRAM) += moto_swap.o
+# Named "zram" so /sys/module/zram and its parameters exist for
+# userspace/kernel-manager detection.
+obj-$(CONFIG_HYBRIDSWAP_ZRAM) += zram.o
