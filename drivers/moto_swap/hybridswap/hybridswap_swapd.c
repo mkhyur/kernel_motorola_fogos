@@ -49,6 +49,12 @@ struct hybridswapd_task {
 	atomic_t swapd_wait_flag;
 	struct task_struct *swapd;
 	struct cpumask swapd_bind_cpumask;
+	unsigned long last_window_start;
+	unsigned long last_window_shrink;
+	unsigned long long skip_interval;
+	bool last_round_is_empty;
+	unsigned long last_swapd_time;
+	unsigned long last_reclaimin_jiffies;
 };
 #define PGDAT_ITEM_DATA(pgdat) ((struct hybridswapd_task*)(pgdat)->android_oem_data1)
 #define PGDAT_ITEM(pgdat, item) (PGDAT_ITEM_DATA(pgdat)->item)
@@ -70,9 +76,6 @@ struct hybridswapd_task {
 #define PAGES_PER_1MB (1 << 8)
 
 unsigned long long total_pagefault_percent;
-unsigned long long swapd_skip_interval;
-bool last_round_is_empty;
-unsigned long last_swapd_time;
 atomic64_t zram_wm_scale = ATOMIC_LONG_INIT(ZRAM_WM_RATIO);
 atomic64_t compress_scale = ATOMIC_LONG_INIT(COMPRESS_RATIO);
 atomic_t usable_mem = ATOMIC_INIT(0);
@@ -107,8 +110,6 @@ atomic_long_t page_fault_pause = ATOMIC_LONG_INIT(0);
 atomic_long_t page_fault_pause_cnt = ATOMIC_LONG_INIT(0);
 static unsigned long swapd_shrink_window = SWAPD_SHRINK_WINDOW;
 static unsigned long swapd_shrink_limit_per_window = SWAPD_SHRINK_SIZE_PER_WINDOW;
-static unsigned long swapd_last_window_start;
-static unsigned long swapd_last_window_shrink;
 static atomic_t swapd_pause = ATOMIC_INIT(0);
 static atomic64_t swapd_shrink_enabled = ATOMIC_LONG_INIT(0);
 static atomic_t swapd_enabled = ATOMIC_INIT(0);
@@ -905,14 +906,26 @@ static ssize_t swapd_shrink_parameter_write(struct kernfs_open_file *of,
 
 static int swapd_shrink_parameter_show(struct seq_file *m, void *v)
 {
+	int nid;
+	struct hybridswapd_task *hyb_task = NULL;
+
 	seq_printf(m, "%-32s %lu(jiffies) %u(msec)\n", "swapd_shrink_window",
 			swapd_shrink_window, jiffies_to_msecs(swapd_shrink_window));
 	seq_printf(m, "%-32s %lu MB\n", "swapd_shrink_limit_per_window",
 			swapd_shrink_limit_per_window);
-	seq_printf(m, "%-32s %u msec\n", "swapd_last_window",
-			jiffies_to_msecs(jiffies - swapd_last_window_start));
-	seq_printf(m, "%-32s %lu MB\n", "swapd_last_window_shrink",
-			swapd_last_window_shrink);
+
+	for_each_node(nid) {
+		hyb_task = PGDAT_ITEM_DATA(NODE_DATA(nid));
+		if (hyb_task)
+			break;
+	}
+
+	if (hyb_task) {
+		seq_printf(m, "%-32s %u msec\n", "swapd_last_window",
+				jiffies_to_msecs(jiffies - hyb_task->last_window_start));
+		seq_printf(m, "%-32s %lu MB\n", "swapd_last_window_shrink",
+				hyb_task->last_window_shrink);
+	}
 
 	return 0;
 }
@@ -1372,8 +1385,8 @@ static void wakeup_swapd(pg_data_t *pgdat, u32 curr_buffers)
 		return;
 	}
 
-	curr_interval = jiffies_to_msecs(jiffies - last_swapd_time);
-	if (curr_interval < swapd_skip_interval) {
+	curr_interval = jiffies_to_msecs(jiffies - hyb_task->last_swapd_time);
+	if (curr_interval < hyb_task->skip_interval) {
 		count_swapd_event(SWAPD_EMPTY_ROUND_SKIP_TIMES);
 		return;
 	}
@@ -1560,6 +1573,7 @@ out:
 static void swapd_shrink_node(pg_data_t *pgdat)
 {
 	const unsigned int increase_rate = 2;
+	struct hybridswapd_task *hyb_task = PGDAT_ITEM_DATA(pgdat);
 	unsigned long nr_reclaimed = 0;
 	unsigned long nr_to_reclaim;
 
@@ -1569,18 +1583,18 @@ static void swapd_shrink_node(pg_data_t *pgdat)
 	if (high_buffer_is_suitable())
 		return;
 
-	if ((jiffies - swapd_last_window_start) < swapd_shrink_window) {
-		if (swapd_last_window_shrink >= swapd_shrink_limit_per_window) {
+	if ((jiffies - hyb_task->last_window_start) < swapd_shrink_window) {
+		if (hyb_task->last_window_shrink >= swapd_shrink_limit_per_window) {
 			count_swapd_event(SWAPD_SKIP_SHRINK_OF_WINDOW);
 			hybp(HYB_DEBUG, "swapd_last_window_shrink %lu, skip shrink\n",
-					swapd_last_window_shrink);
+					hyb_task->last_window_shrink);
 			set_current_state(TASK_INTERRUPTIBLE);
 			schedule_timeout(msecs_to_jiffies(reclaim_exceed_sleep_ms));
 			return;
 		}
 	} else {
-		swapd_last_window_start = jiffies;
-		swapd_last_window_shrink = 0lu;
+		hyb_task->last_window_start = jiffies;
+		hyb_task->last_window_shrink = 0lu;
 	}
 
 	nr_to_reclaim = __calc_nr_to_reclaim();
@@ -1589,23 +1603,23 @@ static void swapd_shrink_node(pg_data_t *pgdat)
 
 	count_swapd_event(SWAPD_SHRINK_ANON);
 	nr_reclaimed = swapd_shrink_anon(pgdat, nr_to_reclaim);
-	swapd_last_window_shrink += PAGES_TO_MB(nr_reclaimed);
+	hyb_task->last_window_shrink += PAGES_TO_MB(nr_reclaimed);
 
 	if (nr_reclaimed < fetch_nothing_ignore_check_level_value()) {
 		count_swapd_event(SWAPD_EMPTY_ROUND);
-		if (last_round_is_empty)
-			swapd_skip_interval = min(swapd_skip_interval *
+		if (hyb_task->last_round_is_empty)
+			hyb_task->skip_interval = min(hyb_task->skip_interval *
 					increase_rate,
 					fetch_max_skip_interval_value());
 		else
-			swapd_skip_interval =
+			hyb_task->skip_interval =
 				fetch_nothing_ignore_skip_interval_value();
-		last_round_is_empty = true;
+		hyb_task->last_round_is_empty = true;
 		hybp(HYB_DEBUG, "SWAPD_SHRINK_EMPTY_ROUND, reclaimed %lu KB, swapd_skip_interval %llu\n",
-				(unsigned long)nr_reclaimed * 4, swapd_skip_interval);
+				(unsigned long)nr_reclaimed * 4, hyb_task->skip_interval);
 	} else {
-		swapd_skip_interval = 0;
-		last_round_is_empty = false;
+		hyb_task->skip_interval = 0;
+		hyb_task->last_round_is_empty = false;
 	}
 }
 
@@ -1614,7 +1628,6 @@ static int swapd(void *p)
 	pg_data_t *pgdat = (pg_data_t *)p;
 	struct task_struct *tsk = current;
 	struct hybridswapd_task* hyb_task = PGDAT_ITEM_DATA(pgdat);
-	static unsigned long last_reclaimin_jiffies = 0;
 	long page_fault_pause_value;
 
 	swapid = tsk->pid;
@@ -1623,7 +1636,7 @@ static int swapd(void *p)
 	(void)swapd_update_cpumask(tsk, SWAPD_DEFAULT_BIND_CPUS, pgdat);
 	set_freezable();
 
-	swapd_last_window_start = jiffies - swapd_shrink_window;
+	hyb_task->last_window_start = jiffies - swapd_shrink_window;
 	while (!kthread_should_stop()) {
 		bool pagefault = false;
 		u64 available, wmhigh;
@@ -1646,12 +1659,12 @@ static int swapd(void *p)
 		if (atomic64_read(&swapd_shrink_enabled))
 			swapd_shrink_node(pgdat);
 
-		last_swapd_time = jiffies;
+		hyb_task->last_swapd_time = jiffies;
 do_eswap:
 		page_fault_pause_value = atomic_long_read(&page_fault_pause);
 		if (!hybridswap_reclaim_work_running() && (zram_need_swapout() || pagefault)
 				&& !page_fault_pause_value
-				&& jiffies_to_msecs(jiffies - last_reclaimin_jiffies) >= 50) {
+				&& jiffies_to_msecs(jiffies - hyb_task->last_reclaimin_jiffies) >= 50) {
 			wmhigh = fetch_high_mem_watermark_value();
 			available = system_cur_usable_mem();
 
@@ -1663,7 +1676,7 @@ do_eswap:
 						(unsigned int)available, (unsigned long)wmhigh, (unsigned long)(to_swapout / SZ_1M));
 				swapped_size = hybridswap_out_to_eswap(to_swapout);
 				count_swapd_event(SWAPD_SWAPOUT);
-				last_reclaimin_jiffies = jiffies;
+				hyb_task->last_reclaimin_jiffies = jiffies;
 				hybp(HYB_INFO, "SWAPD_ESWAPOUT - swapped out %luMB\n", (unsigned long)(swapped_size / SZ_1M));
 #endif
 			} else  {
