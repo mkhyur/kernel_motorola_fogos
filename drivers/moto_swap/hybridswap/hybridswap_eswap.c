@@ -2081,18 +2081,32 @@ static int eswap_unlock(struct io_eswapent *io_eswap)
 	hybp(HYB_DEBUG, "add eswapid = %d, cnt = %d.\n",
 			eswapid, io_eswap->cnt);
 	eswpentry = ((unsigned long)eswapid) << ESWAP_SHIFT;
-	for (k = 0; k < io_eswap->cnt; k++)
-		zram_slot_lock(zram, io_eswap->index[k]);
+	/*
+	 * Process one slot at a time instead of holding every slot's
+	 * bit-spinlock for the whole batch: up to ESWAP_MAX_OBJ_CNT
+	 * locks with preemption off stalled faulters on other CPUs for
+	 * the entire pass.  Slots are marked ZRAM_UNDER_WB by
+	 * shrink_entry(), which keeps writers out (untrack waits for
+	 * the flag to clear) and makes hybridswap_delete() refuse them,
+	 * so nothing may legally change a slot while we work on it;
+	 * re-validate anyway and skip one whose state moved underneath.
+	 */
 	for (k = 0; k < io_eswap->cnt; k++) {
-		move_to_hybridswap(zram, io_eswap->index[k], eswpentry, mcg);
-		size = zram_get_obj_size(zram, io_eswap->index[k]);
+		u32 index = io_eswap->index[k];
+
+		zram_slot_lock(zram, index);
+		if (!zram_test_flag(zram, index, ZRAM_UNDER_WB)) {
+			zram_slot_unlock(zram, index);
+			continue;
+		}
+		move_to_hybridswap(zram, index, eswpentry, mcg);
+		size = zram_get_obj_size(zram, index);
 		eswpentry += size;
 		real_load += size;
+		zram_slot_unlock(zram, index);
 	}
 	put_eswap(zram->infos, eswapid);
 	io_eswap->eswapid = -EINVAL;
-	for (k = 0; k < io_eswap->cnt; k++)
-		zram_slot_unlock(zram, io_eswap->index[k]);
 	hybp(HYB_DEBUG, "add eswap OK.\n");
 out:
 	discard_io_eswapent(io_eswap, REQ_OP_WRITE);
