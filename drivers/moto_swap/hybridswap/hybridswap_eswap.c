@@ -4788,7 +4788,8 @@ void hybridswap_record(struct zram *zram, u32 index,
 
 #ifdef CONFIG_HYBRIDSWAP_SWAPD
 	zram_slot_unlock(zram, index);
-	if (!zram_watermark_ok())
+	/* gated: zram_watermark_ok() walks zones and vmstat counters */
+	if (swapd_wakeup_due() && !zram_watermark_ok())
 		wake_all_swapd();
 	zram_slot_lock(zram, index);
 #endif

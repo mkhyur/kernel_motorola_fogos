@@ -115,6 +115,29 @@ static atomic64_t swapd_shrink_enabled = ATOMIC_LONG_INIT(0);
 static atomic_t swapd_enabled = ATOMIC_INIT(0);
 static unsigned long swapd_nap_jiffies = 1;
 
+/*
+ * Rate-limits swapd wakeup evaluation from the allocator hook and the
+ * zram write path: both fire far more often than a background reclaim
+ * thread needs to be considered, and each evaluation walks zones and
+ * vmstat counters.  One evaluation per interval is enough - the winner
+ * of the cmpxchg does the work, everyone else skips.  Swapd itself
+ * throttles reclaim rounds to >= 50ms, so a 10ms wakeup granularity
+ * stays well inside its design envelope.
+ */
+#define SWAPD_WAKEUP_EVAL_GAP	msecs_to_jiffies(10)
+static atomic_long_t swapd_wakeup_last_eval = ATOMIC_LONG_INIT(0);
+
+bool swapd_wakeup_due(void)
+{
+	unsigned long last = (unsigned long)atomic_long_read(&swapd_wakeup_last_eval);
+	unsigned long now = jiffies;
+
+	if (time_before(now, last + SWAPD_WAKEUP_EVAL_GAP))
+		return false;
+	return atomic_long_cmpxchg(&swapd_wakeup_last_eval,
+				   (long)last, (long)now) == (long)last;
+}
+
 extern unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
 		unsigned long nr_pages,
 		gfp_t gfp_mask,
@@ -1813,7 +1836,7 @@ void rmqueue_hook(void *data, struct zone *preferred_zone,
 		struct zone *zone, unsigned int order, gfp_t gfp_flags,
 		unsigned int alloc_flags, int migratetype)
 {
-	if (gfp_flags & __GFP_KSWAPD_RECLAIM)
+	if ((gfp_flags & __GFP_KSWAPD_RECLAIM) && swapd_wakeup_due())
 		wake_all_swapd();
 }
 
