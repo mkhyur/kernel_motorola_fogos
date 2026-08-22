@@ -235,8 +235,14 @@ struct hybridswap_io {
 
 struct hybridswap_io_req {
 	struct hybridswap_io io_para;
+	/*
+	 * Lock-free refcount.  Every kref_get() happens in the single
+	 * submitting task between hybridswap_plug_start() and
+	 * hybridswap_plug_finish(), which holds the initial reference
+	 * across that whole window, so a get can never race the final
+	 * put to zero and no lock is needed around the kref ops.
+	 */
 	struct kref refcount;
-	struct mutex refmutex;
 	struct wait_queue_head io_wait;
 	atomic_t eswap_doing;
 	struct completion io_end_flag;

@@ -817,9 +817,12 @@ static void hybridswap_wait_io_finish(struct hybridswap_io_req *req)
 
 static void hybridswap_doing_inc(struct hyb_sgm *segment)
 {
-	mutex_lock(&segment->req->refmutex);
+	/*
+	 * Safe without a lock: the submitting task holds the initial
+	 * reference until plug_finish(), so this get can never race a
+	 * put to zero.  See struct hybridswap_io_req.
+	 */
 	kref_get(&segment->req->refcount);
-	mutex_unlock(&segment->req->refmutex);
 	atomic_add(segment->page_cnt, &segment->req->eswap_doing);
 }
 
@@ -899,8 +902,7 @@ static void hybridswap_errio_proc(struct hybridswap_io_req *req,
 	hybridswap_doing_dec(req, segment->page_cnt);
 	hybridswap_io_end_wake_up(req);
 	hyb_sgm_free(req, segment);
-	kref_put_mutex(&req->refcount, hybridswap_io_req_release,
-		&req->refmutex);
+	kref_put(&req->refcount, hybridswap_io_req_release);
 }
 
 static void hybridswap_io_end_work(struct work_struct *work)
@@ -937,8 +939,7 @@ static void hybridswap_io_end_work(struct work_struct *work)
 
 	hybridswap_io_end_wake_up(req);
 
-	kref_put_mutex(&req->refcount, hybridswap_io_req_release,
-		&req->refmutex);
+	kref_put(&req->refcount, hybridswap_io_req_release);
 	kfree(segment);
 
 	set_user_nice(current, old_nice);
@@ -1324,7 +1325,6 @@ void *hybridswap_plug_start(struct hybridswap_io *io_para)
 	}
 
 	kref_init(&req->refcount);
-	mutex_init(&req->refmutex);
 	atomic_set(&req->eswap_doing, 0);
 	init_waitqueue_head(&req->io_wait);
 	req->io_para.bdev = io_para->bdev;
@@ -1375,8 +1375,7 @@ int hybridswap_plug_finish(void *iohandle)
 	hybperf_io_stat(req->io_para.record, req->page_cnt,
 		req->segment_cnt);
 
-	kref_put_mutex(&req->refcount, hybridswap_io_req_release,
-		&req->refmutex);
+	kref_put(&req->refcount, hybridswap_io_req_release);
 
 	hybp(HYB_DEBUG, "io schedule finish succ\n");
 
