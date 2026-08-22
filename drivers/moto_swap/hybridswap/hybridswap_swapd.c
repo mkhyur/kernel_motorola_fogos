@@ -76,8 +76,8 @@ struct hybridswapd_task {
 #define PAGES_PER_1MB (1 << 8)
 
 unsigned long long total_pagefault_percent;
-atomic64_t zram_wm_scale = ATOMIC_LONG_INIT(ZRAM_WM_RATIO);
-atomic64_t compress_scale = ATOMIC_LONG_INIT(COMPRESS_RATIO);
+atomic64_t zram_wm_scale = ATOMIC64_INIT(ZRAM_WM_RATIO);
+atomic64_t compress_scale = ATOMIC64_INIT(COMPRESS_RATIO);
 atomic_t usable_mem = ATOMIC_INIT(0);
 atomic_t min_mem_watermark = ATOMIC_INIT(0);
 atomic_t high_mem_watermark = ATOMIC_INIT(0);
@@ -95,7 +95,7 @@ static unsigned long all_totalreserve_pages;
 
 static wait_queue_head_t refresh_daemonwait;
 static atomic_t refresh_daemonwait_flag;
-static atomic_t refresh_daemoninit_flag = ATOMIC_LONG_INIT(0);
+static atomic_t refresh_daemoninit_flag = ATOMIC_INIT(0);
 static struct task_struct *refresh_daemontask;
 static DEFINE_MUTEX(lowmem_event_lock);
 static DEFINE_MUTEX(swapd_lock);
@@ -226,7 +226,7 @@ static ssize_t usable_mem_params_write(struct kernfs_open_file *of,
 	else
 		atomic_set(&refresh_daemoninit_flag, 1);
 
-	fetch_totalreserve_pages(); // update totalreserve_pages
+	all_totalreserve_pages = fetch_totalreserve_pages();
 
 	wake_all_swapd();
 
@@ -1640,7 +1640,10 @@ static int swapd(void *p)
 	while (!kthread_should_stop()) {
 		bool pagefault = false;
 		u64 available, wmhigh;
-		u64 to_swapout, swapped_size = 0;
+		u64 to_swapout;
+#ifdef CONFIG_HYBRIDSWAP_CORE
+		u64 swapped_size = 0;
+#endif
 
 		wait_event_freezable(hyb_task->swapd_wait,
 				atomic_read(&hyb_task->swapd_wait_flag));
@@ -1763,6 +1766,14 @@ static int mem_hotplug_swapd_notifier(struct notifier_block *nb,
 {
 	struct memory_notify *arg = (struct memory_notify*)data;
 	int nid = arg->status_change_nid;
+
+	/*
+	 * status_change_nid is -1 when the node was already online, e.g.
+	 * when only additional memory sections are onlined. There is
+	 * nothing to do for the swapd threads in that case.
+	 */
+	if (nid < 0)
+		return NOTIFY_OK;
 
 	if (action == MEM_ONLINE)
 		swapd_run(nid);

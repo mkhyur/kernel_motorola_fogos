@@ -4145,6 +4145,7 @@ int hybridswap_bind(struct zram *zram, const char *file_name)
 	}
 
 	nr_pages = (unsigned long)i_size_read(inode) >> PAGE_SHIFT;
+	zram->old_block_size = bdev->bd_block_size;
 	err = set_blocksize(bdev, PAGE_SIZE);
 	if (unlikely(err)) {
 		hybp(HYB_ERR,

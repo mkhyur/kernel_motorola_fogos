@@ -155,7 +155,7 @@ ssize_t hybridswap_vmstat_show(struct device *dev,
 	for (;i < NR_EVENT_ITEMS; i++) {
 		len += snprintf(buf + len, PAGE_SIZE - len, "%-32s %12lu\n",
 				swapd_text[i], vm_buf[i]);
-		if (len == PAGE_SIZE)
+		if (len >= PAGE_SIZE)
 			break;
 	}
 	kfree(vm_buf);
@@ -436,16 +436,12 @@ unsigned long memcg_anon_pages(struct mem_cgroup *memcg)
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 	mz = mem_cgroup_nodeinfo(memcg, 0);
-	if (!mz) {
-		fetch_next_memcg_break(memcg);
+	if (!mz)
 		return 0;
-	}
 
 	lruvec = &mz->lruvec;
-	if (!lruvec) {
-		fetch_next_memcg_break(memcg);
+	if (!lruvec)
 		return 0;
-	}
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
 	return (mem_cgroup_fetch_lru_size(lruvec, LRU_ACTIVE_ANON) +
@@ -473,16 +469,12 @@ static unsigned long memcg_inactive_anon_pages(struct mem_cgroup *memcg)
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 	mz = mem_cgroup_nodeinfo(memcg, 0);
-	if (!mz) {
-		fetch_next_memcg_break(memcg);
+	if (!mz)
 		return 0;
-	}
 
 	lruvec = &mz->lruvec;
-	if (!lruvec) {
-		fetch_next_memcg_break(memcg);
+	if (!lruvec)
 		return 0;
-	}
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
 	return mem_cgroup_fetch_lru_size(lruvec, LRU_INACTIVE_ANON);
