@@ -494,6 +494,11 @@ static inline unsigned long long hybridswap_fetch_zram_pagefault(void)
 	return 0;
 }
 
+static inline unsigned long hybridswap_fetch_zram_used_pages(void)
+{
+	return 0;
+}
+
 static inline bool hybridswap_reclaim_work_running(void)
 {
 	return false;

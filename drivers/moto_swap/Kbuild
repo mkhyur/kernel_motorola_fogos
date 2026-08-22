@@ -26,11 +26,24 @@ EXTRA_CFLAGS += -DCONFIG_HYBRIDSWAP_CORE
 endif
 
 zram-objs += $(ZRAM_SRC)/zram_drv.o
-zram-objs += hybridswap/hybridswap_main.o
-zram-objs += hybridswap/hybridswap_eswap.o
-
-zram-objs += hybridswap/hybridswap_swapd.o
 zram-objs += $(ZRAM_SRC)/zcomp.o
+
+# Each hybridswap object depends on the kconfig feature whose structs,
+# table flags and sysfs attributes it references, and zram_drv.c only
+# calls into them under the matching #ifdef. Build them conditionally
+# so the plain-zram configurations keep compiling.
+ifneq ($(filter y,$(CONFIG_HYBRIDSWAP)),)
+zram-objs += hybridswap/hybridswap_main.o
+endif
+
+# hybridswap_eswap.c implements the HYBRIDSWAP_CORE backend.
+ifneq ($(filter y,$(CONFIG_HYBRIDSWAP_CORE)),)
+zram-objs += hybridswap/hybridswap_eswap.o
+endif
+
+ifneq ($(filter y,$(CONFIG_HYBRIDSWAP_SWAPD)),)
+zram-objs += hybridswap/hybridswap_swapd.o
+endif
 
 # Named "zram" so /sys/module/zram and its parameters exist for
 # userspace/kernel-manager detection.

@@ -1244,7 +1244,7 @@ unsigned long fetch_nr_zram_total(void)
 		return nr_zram;
 
 	nr_zram = swapd_zram->disksize >> PAGE_SHIFT;
-#if (defined CONFIG_ZRAM_WRITEBACK) || (defined CONFIG_HYBRIDSWAP_CORE)
+#if (defined CONFIG_HYBRIDSWAP_ZRAM_WRITEBACK) || (defined CONFIG_HYBRIDSWAP_CORE)
 	nr_zram -= swapd_zram->increase_nr_pages;
 #endif
 	return nr_zram ?: 1;

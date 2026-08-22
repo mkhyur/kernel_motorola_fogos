@@ -110,6 +110,7 @@ config HYBRIDSWAP_CORE
 
 # Compatibility alias so userspace/kernel-manager apps that probe
 # CONFIG_ZRAM see zram enabled; the real driver is HYBRIDSWAP_ZRAM.
+# Must stay tristate to match the definition in drivers/block/zram/Kconfig.
 config ZRAM
-	bool "Legacy alias for hybridswap zram"
+	tristate "Legacy alias for hybridswap zram"
 	default y if HYBRIDSWAP_ZRAM
