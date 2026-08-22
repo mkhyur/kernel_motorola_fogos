@@ -348,6 +348,7 @@ static inline void put_memcg_cache(memcg_hybs_t *hybs)
 
 DECLARE_PER_CPU(struct swapd_event_state, swapd_event_states);
 extern struct mutex reclaim_para_lock;
+extern struct mutex hybridswap_enable_lock;
 
 static inline void __count_swapd_event(enum hybridswap_event_item item)
 {

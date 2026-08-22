@@ -12,6 +12,8 @@
 #include <linux/spinlock.h>
 #include <linux/memcontrol.h>
 #include <linux/swap.h>
+#include <linux/kref.h>
+#include <linux/rcupdate.h>
 #ifdef CONFIG_FG_TASK_UID
 #include <linux/healthinfo/fg.h>
 #endif
@@ -100,6 +102,8 @@ struct io_work_arg {
 	struct hybridswap_buffer io_buf;
 	struct io_priv data;
 	struct hybridswap_key_point_record record;
+	/* keeps zram->infos tables alive until this I/O chain is done */
+	struct hyb_info *infos;
 };
 
 struct hyb_sgm_time {
@@ -139,6 +143,16 @@ struct hyb_info {
 	atomic_t *eswap_stored_pages;
 
 	unsigned int memcgid_cnt[MEM_CGROUP_ID_MAX + 1];
+
+	/*
+	 * refs protects the tables against in-flight I/O and reclaim
+	 * work while zram->infos is being replaced or torn down.
+	 * The initial reference is held by the zram->infos pointer
+	 * itself; the final put defers free_hyb_info() via RCU so that
+	 * lockless readers of zram->infos never touch freed memory.
+	 */
+	struct kref refs;
+	struct rcu_head rcu;
 };
 
 struct hyb_entries_head {
@@ -245,6 +259,9 @@ bool hyb_entries_test_priv(int index, struct hyb_entries_table *table);
 bool hyb_entries_empty(int hindex, struct hyb_entries_table *table);
 void zram_set_mcg(struct zram *zram, u32 index, int memcgid);
 struct mem_cgroup *zram_fetch_mcg(struct zram *zram, u32 index);
+static struct hyb_info *hyb_info_get(struct zram *zram);
+static void hyb_info_put(struct hyb_info *infos);
+static struct hyb_info *hyb_info_detach(struct zram *zram);
 int zram_fetch_mcg_last_index(struct hyb_info *infos,
 		struct mem_cgroup *mcg,
 		int *index, int max_cnt);
@@ -1819,6 +1836,9 @@ static void copy_from_pages(u8 *dst, struct page *pages[],
 
 static bool zram_test_skip(struct zram *zram, u32 index, struct mem_cgroup *mcg)
 {
+	struct mem_cgroup *tmp_mcg;
+	bool skip;
+
 	if (zram_test_flag(zram, index, ZRAM_WB))
 		return true;
 	if (zram_test_flag(zram, index, ZRAM_UNDER_WB))
@@ -1827,7 +1847,11 @@ static bool zram_test_skip(struct zram *zram, u32 index, struct mem_cgroup *mcg)
 		return true;
 	if (zram_test_flag(zram, index, ZRAM_SAME))
 		return true;
-	if (mcg != zram_fetch_mcg(zram, index))
+	tmp_mcg = zram_fetch_mcg(zram, index);
+	skip = (mcg != tmp_mcg);
+	if (tmp_mcg)
+		css_put(&tmp_mcg->css);
+	if (skip)
 		return true;
 	if (!zram_get_obj_size(zram, index))
 		return true;
@@ -1883,6 +1907,7 @@ static void update_size_info(struct zram *zram, u32 index)
 			atomic64_dec(&hybs->hybridswap_stored_pages);
 		} else
 			hybp(HYB_ERR, "NULL hybs\n");
+		css_put(&mcg->css);
 	} else
 		hybp(HYB_ERR, "NULL mcg\n");
 	zram_clear_flag(zram, index, ZRAM_IN_BD);
@@ -2276,13 +2301,18 @@ void hybridswap_manager_deinit(struct zram *zram)
 		return;
 	}
 
-	free_hyb_info(zram->infos);
-	zram->infos = NULL;
+	/*
+	 * Detach the tables from the device; in-flight holders keep
+	 * them alive via their references and RCU retires the memory
+	 * once the last one is gone.
+	 */
+	hyb_info_detach(zram);
 }
 
 int hybridswap_manager_init(struct zram *zram)
 {
 	int ret;
+	struct hyb_info *old;
 
 	if (!zram) {
 		hybp(HYB_ERR, "NULL zram\n");
@@ -2290,6 +2320,17 @@ int hybridswap_manager_init(struct zram *zram)
 		goto out;
 	}
 
+	/*
+	 * Reuse the existing tables when they still match the device
+	 * geometry, so an enable/disable/enable cycle neither leaks
+	 * the old tables nor orphans WB pages that reference them.
+	 */
+	old = rcu_dereference_protected(zram->infos, true);
+	if (old && old->total_objects == (int)(zram->disksize >> PAGE_SHIFT) &&
+	    old->nr_es == (int)((zram->nr_pages << PAGE_SHIFT) >> ESWAP_SHIFT))
+		return 0;
+
+	hyb_info_detach(zram);
 	zram->infos = alloc_hyb_info(zram->disksize,
 					  zram->nr_pages << PAGE_SHIFT);
 	if (!zram->infos) {
@@ -2341,6 +2382,8 @@ void hybridswap_manager_memcg_deinit(struct mem_cgroup *mcg)
 {
 	struct zram *zram = NULL;
 	struct hyb_info *infos = NULL;
+	struct mem_cgroup *tmp_mcg;
+	bool match;
 	struct hybstatus *stat = hybridswap_fetch_stat_obj();
 	int last_index = -1;
 	memcg_hybs_t *hybs;
@@ -2383,7 +2426,11 @@ void hybridswap_manager_memcg_deinit(struct mem_cgroup *mcg)
 		}
 
 		zram_slot_lock(zram, index);
-		if (index == last_index || mcg == zram_fetch_mcg(zram, index)) {
+		tmp_mcg = zram_fetch_mcg(zram, index);
+		match = (index == last_index || mcg == tmp_mcg);
+		if (tmp_mcg)
+			css_put(&tmp_mcg->css);
+		if (match) {
 			hyb_entries_del(obj_index(zram->infos, index),
 					memcgindex(zram->infos, mcg->id.id),
 					zram->infos->objects);
@@ -2554,17 +2601,25 @@ void hybridswap_eswap_objs_del(struct zram *zram, u32 index)
 
 	zram_clear_flag(zram, index, ZRAM_IN_BD);
 	if (!atomic_dec_and_test(
-			&zram->infos->eswap_stored_pages[esentry_extid(eswpentry)]))
+			&zram->infos->eswap_stored_pages[esentry_extid(eswpentry)])) {
+		if (mcg)
+			css_put(&mcg->css);
 		return;
+	}
 	eswapid = fetch_eswap(zram->infos, esentry_extid(eswpentry));
-	if (eswapid < 0)
+	if (eswapid < 0) {
+		if (mcg)
+			css_put(&mcg->css);
 		return;
+	}
 
 	atomic64_inc(&stat->notify_free);
 	if (mcg)
 		atomic64_inc(&MEMCGRP_ITEM(mcg, hybridswap_eswap_notify_free));
 	hybp(HYB_DEBUG, "free eswapid = %d\n", eswapid);
 	hybridswap_free_eswap(zram->infos, eswapid);
+	if (mcg)
+		css_put(&mcg->css);
 }
 
 int hybridswap_find_eswap_by_index(unsigned long eswpentry,
@@ -2597,11 +2652,10 @@ int hybridswap_find_eswap_by_index(unsigned long eswpentry,
 
 	io_eswap->eswapid = eswapid;
 	io_eswap->zram = zram;
+	/* find_memcg_by_id() already returns a css reference */
 	io_eswap->mcg = find_memcg_by_id(
 				hyb_entries_fetch_memcgid(eswap_index(zram->infos, eswapid),
 						  zram->infos->eswap_table));
-	if (io_eswap->mcg)
-		css_get(&io_eswap->mcg->css);
 	buf->dest_pages = io_eswap->pages;
 	(*private) = io_eswap;
 	hybp(HYB_DEBUG, "fetch entry = %lx eswap = %d\n", eswpentry, eswapid);
@@ -2880,10 +2934,15 @@ void swap_sorted_list_del(struct zram *zram, u32 index)
 	}
 
 	mcg = zram_fetch_mcg(zram, index);
-	if (!mcg || !MEMCGRP_ITEM(mcg, zram) || !MEMCGRP_ITEM(mcg, zram)->infos)
+	if (!mcg || !MEMCGRP_ITEM(mcg, zram) || !MEMCGRP_ITEM(mcg, zram)->infos) {
+		if (mcg)
+			css_put(&mcg->css);
 		return;
-	if (zram_test_flag(zram, index, ZRAM_SAME))
+	}
+	if (zram_test_flag(zram, index, ZRAM_SAME)) {
+		css_put(&mcg->css);
 		return;
+	}
 
 	size = zram_get_obj_size(zram, index);
 	hyb_entries_del(obj_index(zram->infos, index),
@@ -2895,6 +2954,7 @@ void swap_sorted_list_del(struct zram *zram, u32 index)
 	atomic64_dec(&MEMCGRP_ITEM(mcg, zram_page_size));
 	atomic64_sub(size, &stat->zram_stored_size);
 	atomic64_dec(&stat->zram_stored_pages);
+	css_put(&mcg->css);
 }
 
 void swap_maps_insert(struct zram *zram, u32 index)
@@ -3247,12 +3307,18 @@ bool hyb_entries_clear_priv(int index, struct hyb_entries_table *table)
 	return ret;
 }
 
+/*
+ * Returns the memcg for an id with a css reference held by the
+ * caller, or NULL. The caller must css_put() the returned memcg.
+ */
 struct mem_cgroup *find_memcg_by_id(unsigned short memcgid)
 {
 	struct mem_cgroup *mcg = NULL;
 
 	rcu_read_lock();
 	mcg = mem_cgroup_from_id(memcgid);
+	if (mcg && !css_tryget(&mcg->css))
+		mcg = NULL;
 	rcu_read_unlock();
 
 	return mcg;
@@ -3478,10 +3544,20 @@ static struct hyb_entries_head *fetch_objects_node(int index, void *private)
 	index -= infos->nr_es;
 	if (index > 0 && index < infos->memcg_num) {
 		struct mem_cgroup *mcg = find_memcg_by_id(index);
+		struct hyb_entries_head *node;
 
 		if (!mcg)
 			goto err_out;
-		return (struct hyb_entries_head *)(&MEMCGRP_ITEM(mcg, swap_sorted_list));
+		node = (struct hyb_entries_head *)(&MEMCGRP_ITEM(mcg, swap_sorted_list));
+		/*
+		 * The node lives in the memcg's hybridswap data. It is
+		 * safe to use after dropping the reference: callers
+		 * only touch it while holding the list head's bitlock,
+		 * and a dying memcg's entries are unlinked under that
+		 * same lock before its id can be removed.
+		 */
+		css_put(&mcg->css);
+		return node;
 	}
 err_out:
 	hybp(HYB_ERR, "index = %d invalid, mcg is NULL\n", index);
@@ -3564,10 +3640,14 @@ static struct hyb_entries_head *fetch_eswap_table_node(int index, void *private)
 	index -= infos->nr_es;
 	if (index > 0 && index < infos->memcg_num) {
 		struct mem_cgroup *mcg = find_memcg_by_id(index);
+		struct hyb_entries_head *node;
 
 		if (!mcg)
 			return NULL;
-		return (struct hyb_entries_head *)(&MEMCGRP_ITEM(mcg, eswap_lru));
+		node = (struct hyb_entries_head *)(&MEMCGRP_ITEM(mcg, eswap_lru));
+		/* see the comment in fetch_objects_node() */
+		css_put(&mcg->css);
+		return node;
 	}
 err_out:
 	hybp(HYB_ERR, "index = %d invalid\n", index);
@@ -3627,6 +3707,60 @@ void free_hyb_info(struct hyb_info *infos)
 	vfree(infos);
 }
 
+static void hyb_info_free_rcu(struct rcu_head *head)
+{
+	free_hyb_info(container_of(head, struct hyb_info, rcu));
+}
+
+static void hyb_info_release(struct kref *ref)
+{
+	struct hyb_info *infos = container_of(ref, struct hyb_info, refs);
+
+	call_rcu(&infos->rcu, hyb_info_free_rcu);
+}
+
+/*
+ * Take a reference on zram->infos for the duration of an operation.
+ * Pairs with hyb_info_put(). Callers may sleep while holding the
+ * reference; only the lookup itself is lockless.
+ */
+static struct hyb_info *hyb_info_get(struct zram *zram)
+{
+	struct hyb_info *infos;
+
+	rcu_read_lock();
+	infos = rcu_dereference(zram->infos);
+	if (infos && !kref_get_unless_zero(&infos->refs))
+		infos = NULL;
+	rcu_read_unlock();
+
+	return infos;
+}
+
+static void hyb_info_put(struct hyb_info *infos)
+{
+	if (infos)
+		kref_put(&infos->refs, hyb_info_release);
+}
+
+/*
+ * Detach zram->infos from the device. The tables stay alive until
+ * every holder drops its reference; RCU then retires the memory.
+ */
+static struct hyb_info *hyb_info_detach(struct zram *zram)
+{
+	struct hyb_info *infos;
+
+	infos = rcu_dereference_protected(zram->infos, true);
+	if (!infos)
+		return NULL;
+
+	rcu_assign_pointer(zram->infos, NULL);
+	kref_put(&infos->refs, hyb_info_release);
+
+	return infos;
+}
+
 struct hyb_info *alloc_hyb_info(unsigned long ori_size,
 					    unsigned long comp_size)
 {
@@ -3645,6 +3779,7 @@ struct hyb_info *alloc_hyb_info(unsigned long ori_size,
 	infos->nr_es = comp_size >> ESWAP_SHIFT;
 	infos->memcg_num = MEM_CGROUP_ID_MAX;
 	infos->total_objects = ori_size >> PAGE_SHIFT;
+	kref_init(&infos->refs);
 	infos->bitmask = vzalloc(BITS_TO_LONGS(infos->nr_es) * sizeof(long));
 	if (!infos->bitmask) {
 		hybp(HYB_ERR, "infos->bitmask alloc failed, %lu\n",
@@ -4041,9 +4176,7 @@ bool hybridswap_core_enabled(void)
 void hybridswap_set_enable(bool en)
 {
 	hybridswap_set_out_to_eswap_enable(en);
-
-	if (!hybridswap_core_enabled())
-		atomic_set(&global_settings.enable, en ? 1 : 0);
+	atomic_set(&global_settings.enable, en ? 1 : 0);
 }
 
 struct hybstatus *hybridswap_fetch_stat_obj(void)
@@ -4330,10 +4463,19 @@ ssize_t hybridswap_core_enable_store(struct device *dev,
 		return -EINVAL;
 	}
 
-	if (hybridswap_set_enable_init(!!val))
+	/*
+	 * Serialize against hybridswap_enable_store() and
+	 * hybridswap_loop_device_store(): concurrent enable/disable
+	 * must not interleave with manager init or device binding.
+	 */
+	mutex_lock(&hybridswap_enable_lock);
+	if (hybridswap_set_enable_init(!!val)) {
+		mutex_unlock(&hybridswap_enable_lock);
 		return -EINVAL;
+	}
 
 	hybridswap_set_enable(!!val);
+	mutex_unlock(&hybridswap_enable_lock);
 
 	return len;
 }
@@ -4373,7 +4515,14 @@ ssize_t hybridswap_loop_device_store(struct device *dev,
 		goto out;
 	}
 
+	/*
+	 * Binding must not interleave with an enable/disable in
+	 * flight: manager_init sizes the tables from zram->nr_pages,
+	 * which this path sets. Lock order: init_lock -> enable_lock.
+	 */
+	mutex_lock(&hybridswap_enable_lock);
 	ret = hybridswap_core_init(zram);
+	mutex_unlock(&hybridswap_enable_lock);
 	if (ret) {
 		hybp(HYB_ERR, "hybridswap_core_init failed, ret=%d\n", ret);
 		goto out;
@@ -4594,15 +4743,20 @@ void hybridswap_record(struct zram *zram, u32 index,
 {
 	memcg_hybs_t *hybs;
 	struct hybstatus *stat;
+	struct hyb_info *infos;
 
 	if (!hybridswap_core_enabled())
+		return;
+
+	infos = hyb_info_get(zram);
+	if (!infos)
 		return;
 
 	if (!memcg || !memcg->id.id) {
 		stat = hybridswap_fetch_stat_obj();
 		if (stat)
 			atomic64_inc(&stat->null_memcg_skip_track_cnt);
-		return;
+		goto out;
 	}
 
 	/* app memcg id start from 4
@@ -4610,7 +4764,7 @@ void hybridswap_record(struct zram *zram, u32 index,
 	 */
 	if (memcg->id.id < 4) {
 		hybp(HYB_DEBUG, "Skip non app memcg id=%d, comm=%s\n", memcg->id.id, current->comm);
-		return;
+		goto out;
 	}
 
 	hybs = MEMCGRP_ITEM_DATA(memcg);
@@ -4620,7 +4774,7 @@ void hybridswap_record(struct zram *zram, u32 index,
 			stat = hybridswap_fetch_stat_obj();
 			if (stat)
 				atomic64_inc(&stat->skip_track_cnt);
-			return;
+			goto out;
 		}
 	}
 
@@ -4639,11 +4793,19 @@ void hybridswap_record(struct zram *zram, u32 index,
 		wake_all_swapd();
 	zram_slot_lock(zram, index);
 #endif
+out:
+	hyb_info_put(infos);
 }
 
 void hybridswap_untrack(struct zram *zram, u32 index)
 {
+	struct hyb_info *infos;
+
 	if (!hybridswap_core_enabled())
+		return;
+
+	infos = hyb_info_get(zram);
+	if (!infos)
 		return;
 
 	while (zram_test_flag(zram, index, ZRAM_UNDER_WB) ||
@@ -4654,6 +4816,7 @@ void hybridswap_untrack(struct zram *zram, u32 index)
 	}
 
 	hybridswap_swap_sorted_list_del(zram, index);
+	hyb_info_put(infos);
 }
 
 static unsigned long memcg_reclaim_size(struct mem_cgroup *memcg)
@@ -4741,9 +4904,24 @@ static void hybridswap_free_pagepool(struct io_work_arg *iowork)
 	spin_unlock(&iowork->data.page_pool.page_pool_lock);
 }
 
+/*
+ * Completion notify for the synchronous FAULT_OUT class: its
+ * io_work_arg lives on the faulting task's stack, so unlike
+ * hybridswap_plug_complete() it must not be freed here - only the
+ * table reference is released, after all end-io work is done.
+ */
+static void hybridswap_fault_io_release(void *data)
+{
+	struct io_work_arg *iowork = (struct io_work_arg *)data;
+
+	hyb_info_put(iowork->infos);
+}
+
 static void hybridswap_plug_complete(void *data)
 {
 	struct io_work_arg *iowork  = (struct io_work_arg *)data;
+
+	hyb_info_put(iowork->infos);
 
 	hybridswap_free_pagepool(iowork);
 
@@ -4757,6 +4935,16 @@ static void *hybridswap_init_plug(struct zram *zram,
 		struct io_work_arg *iowork)
 {
 	struct hybridswap_io io_para;
+
+	/*
+	 * Hold the tables alive for as long as this I/O chain can
+	 * reach them. The reference is dropped by the completion
+	 * notify, which runs only after every end-io work (including
+	 * error callbacks) has finished touching the tables.
+	 */
+	iowork->infos = hyb_info_get(zram);
+	if (!iowork->infos)
+		return NULL;
 
 	io_para.bdev = zram->bdev;
 	io_para.class = class;
@@ -4776,7 +4964,7 @@ static void *hybridswap_init_plug(struct zram *zram,
 		iowork->io_buf.pool = &iowork->data.page_pool;
 		break;
 	case HYB_FAULT_OUT:
-		io_para.complete_notify = NULL;
+		io_para.complete_notify = hybridswap_fault_io_release;
 		iowork->io_buf.pool = NULL;
 		break;
 	default:
@@ -4926,6 +5114,7 @@ static int hybridswap_permcg_reclaim(struct mem_cgroup *memcg,
 	if (unlikely(!iowork->iohandle)) {
 		hybp(HYB_ERR, "plug start failed!\n");
 		hybperf_end(&iowork->record);
+		hyb_info_put(iowork->infos);
 		hybridswap_free(iowork);
 		hybstatus_alloc_fail(HYB_RECLAIM_IN, -ENOMEM);
 		ret = -EIO;
@@ -5139,6 +5328,7 @@ static int hybridswap_do_batches_init(struct io_work_arg **out_sched,
 	if (unlikely(!iowork->iohandle)) {
 		hybp(HYB_ERR, "plug start failed!\n");
 		hybperf_end(&iowork->record);
+		hyb_info_put(iowork->infos);
 		hybridswap_free(iowork);
 		hybstatus_alloc_fail(HYB_BATCH_OUT, -ENOMEM);
 
@@ -5156,11 +5346,18 @@ static int hybridswap_do_batches(struct mem_cgroup *mcg,
 	int ret = 0;
 	int errio = 0;
 	struct io_work_arg *iowork = NULL;
+	struct hyb_info *infos;
 
 	if (unlikely(!mcg || !MEMCGRP_ITEM(mcg, zram))) {
 		hybp(HYB_WARN, "no zram in mcg!\n");
 		ret = -EINVAL;
-		goto out;
+		goto out_no_ref;
+	}
+
+	infos = hyb_info_get(MEMCGRP_ITEM(mcg, zram));
+	if (!infos) {
+		ret = -EINVAL;
+		goto out_no_ref;
 	}
 
 	ret = hybridswap_do_batches_init(&iowork, mcg, preload);
@@ -5189,6 +5386,8 @@ static int hybridswap_do_batches(struct mem_cgroup *mcg,
 	atomic64_inc(&MEMCGRP_ITEM(mcg, hybridswap_incnt));
 	MEMCGRP_ITEM(mcg, in_swapin) = false;
 out:
+	hyb_info_put(infos);
+out_no_ref:
 	return ret;
 }
 
@@ -5238,8 +5437,10 @@ static void hybridswap_fault_stat(struct zram *zram, u32 index)
 	atomic64_inc(&stat->fault_cnt);
 
 	mcg = hybridswap_zram_fetch_mcg(zram, index);
-	if (mcg)
+	if (mcg) {
 		atomic64_inc(&MEMCGRP_ITEM(mcg, hybridswap_allfaultcnt));
+		css_put(&mcg->css);
+	}
 }
 
 static void hybridswap_fault2_stat(struct zram *zram, u32 index)
@@ -5253,8 +5454,10 @@ static void hybridswap_fault2_stat(struct zram *zram, u32 index)
 	atomic64_inc(&stat->hybridswap_fault_cnt);
 
 	mcg = hybridswap_zram_fetch_mcg(zram, index);
-	if (mcg)
+	if (mcg) {
 		atomic64_inc(&MEMCGRP_ITEM(mcg, hybridswap_faultcnt));
+		css_put(&mcg->css);
+	}
 }
 
 static bool hybridswap_page_fault_check(struct zram *zram,
@@ -5408,11 +5611,21 @@ int hybridswap_page_fault(struct zram *zram, u32 index)
 	int errio;
 	struct io_work_arg iowork;
 	unsigned long zentry;
+	struct hyb_info *infos;
 	ktime_t start = ktime_get();
 	unsigned long long start_ravg_sum = hybridswap_fetch_ravg_sum();
 
-	if (!hybridswap_page_fault_check(zram, index, &zentry))
+	if (!hybridswap_core_enabled())
 		return ret;
+
+	infos = hyb_info_get(zram);
+	if (!infos)
+		return ret;
+
+	if (!hybridswap_page_fault_check(zram, index, &zentry)) {
+		hyb_info_put(infos);
+		return ret;
+	}
 
 	memset(&iowork.record, 0, sizeof(struct hybridswap_key_point_record));
 	hybperf_start(&iowork.record, start, start_ravg_sum,
@@ -5428,6 +5641,8 @@ int hybridswap_page_fault(struct zram *zram, u32 index)
 		ret = -EIO;
 		hybridswap_fail_record(HYB_FAULT_OUT_INIT_FAIL,
 				index, 0, iowork.record.task_comm);
+		/* no req was created, the notify will never run */
+		hyb_info_put(iowork.infos);
 
 		goto out;
 	}
@@ -5445,13 +5660,21 @@ out:
 	ret = hybridswap_page_fault_exit_check(zram, index, ret);
 	hybperfiowrkend(&iowork.record, HYB_ZRAM_LOCK);
 	hybperf_end(&iowork.record);
+	hyb_info_put(infos);
 
 	return ret;
 }
 
 bool hybridswap_delete(struct zram *zram, u32 index)
 {
+	struct hyb_info *infos;
+	bool ret = true;
+
 	if (!hybridswap_core_enabled())
+		return true;
+
+	infos = hyb_info_get(zram);
+	if (!infos)
 		return true;
 
 	if (zram_test_flag(zram, index, ZRAM_UNDER_WB)
@@ -5460,29 +5683,45 @@ bool hybridswap_delete(struct zram *zram, u32 index)
 
 		if (stat)
 			atomic64_inc(&stat->miss_free);
-		return false;
+		ret = false;
+		goto out;
 	}
 
-	if (!zram_test_flag(zram, index, ZRAM_WB))
-		return true;
+	if (zram_test_flag(zram, index, ZRAM_WB))
+		hybridswap_eswap_objs_del(zram, index);
 
-	hybridswap_eswap_objs_del(zram, index);
-
-	return true;
+out:
+	hyb_info_put(infos);
+	return ret;
 }
 
 void hybridswap_mem_cgroup_deinit(struct mem_cgroup *memcg)
 {
+	struct zram *zram;
+	memcg_hybs_t *hybs;
+	struct hyb_info *infos;
+
 	if (!hybridswap_core_enabled())
 		return;
 
+	hybs = MEMCGRP_ITEM_DATA(memcg);
+	if (!hybs || !hybs->zram)
+		return;
+
+	zram = hybs->zram;
+	infos = hyb_info_get(zram);
+	if (!infos)
+		return;
+
 	hybridswap_manager_memcg_deinit(memcg);
+	hyb_info_put(infos);
 }
 
 void hybridswap_force_reclaim(struct mem_cgroup *mcg)
 {
 	unsigned long mcg_reclaimed_size = 0, require_size;
 	memcg_hybs_t *hybs;
+	struct hyb_info *infos;
 
 	if (!hybridswap_core_enabled() || !hybridswap_out_to_eswap_enable()
 	    || hybridswap_reach_life_protect())
@@ -5495,12 +5734,17 @@ void hybridswap_force_reclaim(struct mem_cgroup *mcg)
 	if (!hybs || !hybs->zram)
 		return;
 
+	infos = hyb_info_get(hybs->zram);
+	if (!infos)
+		return;
+
 	mutex_lock(&hybs->swap_lock);
 	require_size = atomic64_read(&hybs->zram_stored_size) / 2;
 	hybs->force_swapout = true;
 	hybridswap_permcg_reclaim(mcg, require_size, &mcg_reclaimed_size);
 	hybs->force_swapout = false;
 	mutex_unlock(&hybs->swap_lock);
+	hyb_info_put(infos);
 }
 
 void mem_cgroup_id_remove_hook(void *data, struct mem_cgroup *memcg)

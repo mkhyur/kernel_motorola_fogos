@@ -76,7 +76,12 @@ static int log_level = HYB_MAX;
 static struct kmem_cache *hybridswap_cache;
 static struct list_head grade_head;
 static DEFINE_SPINLOCK(grade_list_lock);
-static DEFINE_MUTEX(hybridswap_enable_lock);
+/*
+ * Serializes every administrative entry point that mutates the
+ * hybridswap core lifecycle: hybridswap_enable_store,
+ * hybridswap_core_enable_store and hybridswap_loop_device_store.
+ */
+DEFINE_MUTEX(hybridswap_enable_lock);
 static bool hybridswap_enabled = false;
 
 DEFINE_MUTEX(reclaim_para_lock);
