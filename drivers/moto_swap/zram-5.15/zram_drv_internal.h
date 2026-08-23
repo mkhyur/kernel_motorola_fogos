@@ -9,7 +9,7 @@
 
 #define zram_slot_unlock(zram, index) (bit_spin_unlock(ZRAM_LOCK, &zram->table[index].flags))
 
-#define init_done(zram)  (zram->disksize)
+#define init_done(zram)  (!!(zram->disksize))
 
 #define dev_to_zram(dev) ((struct zram *)dev_to_disk(dev)->private_data)
 
