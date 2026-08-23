@@ -34,6 +34,7 @@
 #include <linux/sysfs.h>
 #include <linux/debugfs.h>
 #include <linux/cpuhotplug.h>
+#include <linux/delay.h>
 
 #include "zram_drv.h"
 #include "zram_drv_internal.h"
@@ -1379,10 +1380,20 @@ compress_again:
 	atomic64_add(comp_len, &zram->stats.compr_data_size);
 out:
 	/*
-	 * Free memory associated with this sector
-	 * before overwriting unused sectors.
+	 * Wait out eswap operations claiming this slot: a fault-out fetch
+	 * (ZRAM_BATCHING_OUT) or a shrink writeback (ZRAM_UNDER_WB) installs
+	 * its result under this lock, so overwriting mid-flight would feed
+	 * the reader whichever page got stored last and corrupt the
+	 * operation's accounting.  Same discipline as
+	 * hybridswap_swap_sorted_list_del().
 	 */
 	zram_slot_lock(zram, index);
+	while (zram_test_flag(zram, index, ZRAM_UNDER_WB) ||
+	       zram_test_flag(zram, index, ZRAM_BATCHING_OUT)) {
+		zram_slot_unlock(zram, index);
+		udelay(50);
+		zram_slot_lock(zram, index);
+	}
 	zram_free_page(zram, index);
 
 	if (comp_len == PAGE_SIZE) {
