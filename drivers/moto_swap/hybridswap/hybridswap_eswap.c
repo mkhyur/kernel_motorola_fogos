@@ -18,6 +18,7 @@
 #include <linux/healthinfo/fg.h>
 #endif
 #include <linux/version.h>
+#include <linux/wait_bit.h>
 
 #ifdef CONFIG_ZRAM_5_4
 #include "../zram-5.4/zram_drv.h"
@@ -1758,6 +1759,7 @@ static void discard_io_eswapent(struct io_eswapent *io_eswap, unsigned int op)
 			swap_sorted_list_add_tail(zram, index, io_eswap->mcg);
 		zram_clear_flag(zram, index, ZRAM_UNDER_WB);
 		zram_slot_unlock(zram, index);
+		wake_up_var(&zram->table[index].flags);
 	}
 	hybridswap_free_eswap(zram->infos, io_eswap->eswapid);
 out:
@@ -2104,6 +2106,7 @@ static int eswap_unlock(struct io_eswapent *io_eswap)
 		eswpentry += size;
 		real_load += size;
 		zram_slot_unlock(zram, index);
+		wake_up_var(&zram->table[index].flags);
 	}
 	put_eswap(zram->infos, eswapid);
 	io_eswap->eswapid = -EINVAL;
@@ -5588,6 +5591,7 @@ static int hybridswap_page_fault_exit_check(struct zram *zram,
 		}
 	}
 	zram_clear_flag(zram, index, ZRAM_BATCHING_OUT);
+	wake_up_var(&zram->table[index].flags);
 
 	return ret;
 }

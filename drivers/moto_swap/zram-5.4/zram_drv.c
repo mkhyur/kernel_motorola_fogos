@@ -34,7 +34,7 @@
 #include <linux/sysfs.h>
 #include <linux/debugfs.h>
 #include <linux/cpuhotplug.h>
-#include <linux/delay.h>
+#include <linux/wait_bit.h>
 
 #include "zram_drv.h"
 #include "zram_drv_internal.h"
@@ -60,6 +60,38 @@ static size_t huge_class_size;
 static const struct block_device_operations zram_devops;
 
 static void zram_free_page(struct zram *zram, size_t index);
+
+/*
+ * Sleep until no eswap operation claims @index, returning with the slot
+ * locked.  A fault-out fetch (ZRAM_BATCHING_OUT) or a shrink writeback
+ * (ZRAM_UNDER_WB) installs its result under this lock, so freeing or
+ * overwriting the slot mid-flight would feed the reader whichever page
+ * got stored last and corrupt the operation's accounting.  The wait can
+ * span a full eswap IO, so sleep on the slot's flags instead of spinning;
+ * wakers live at every site that clears either flag.
+ */
+static void zram_wait_slot_inflight(struct zram *zram, u32 index)
+{
+	unsigned long *flagsp = &zram->table[index].flags;
+	const unsigned long inflight = BIT(ZRAM_UNDER_WB) | BIT(ZRAM_BATCHING_OUT);
+	int retries = 0;
+
+	zram_slot_lock(zram, index);
+	while (*flagsp & inflight) {
+		zram_slot_unlock(zram, index);
+		wait_var_event_timeout(flagsp, !(*flagsp & inflight),
+				       msecs_to_jiffies(5000));
+		zram_slot_lock(zram, index);
+		if (!(*flagsp & inflight))
+			break;
+		if (++retries >= 2) {
+			/* Completer is stuck or gone; degrade loudly. */
+			WARN_ON_ONCE(1);
+			break;
+		}
+	}
+}
+
 static int zram_bvec_read(struct zram *zram, struct bio_vec *bvec,
 				u32 index, int offset, struct bio *bio);
 
@@ -1090,8 +1122,11 @@ static void zram_meta_free(struct zram *zram, u64 disksize)
 	size_t index;
 
 	/* Free all pages that are still in this zram device */
-	for (index = 0; index < num_pages; index++)
+	for (index = 0; index < num_pages; index++) {
+		zram_wait_slot_inflight(zram, index);
 		zram_free_page(zram, index);
+		zram_slot_unlock(zram, index);
+	}
 
 	zs_destroy_pool(zram->mem_pool);
 	vfree(zram->table);
@@ -1380,20 +1415,10 @@ compress_again:
 	atomic64_add(comp_len, &zram->stats.compr_data_size);
 out:
 	/*
-	 * Wait out eswap operations claiming this slot: a fault-out fetch
-	 * (ZRAM_BATCHING_OUT) or a shrink writeback (ZRAM_UNDER_WB) installs
-	 * its result under this lock, so overwriting mid-flight would feed
-	 * the reader whichever page got stored last and corrupt the
-	 * operation's accounting.  Same discipline as
-	 * hybridswap_swap_sorted_list_del().
+	 * Free memory associated with this sector
+	 * before overwriting unused sectors.
 	 */
-	zram_slot_lock(zram, index);
-	while (zram_test_flag(zram, index, ZRAM_UNDER_WB) ||
-	       zram_test_flag(zram, index, ZRAM_BATCHING_OUT)) {
-		zram_slot_unlock(zram, index);
-		udelay(50);
-		zram_slot_lock(zram, index);
-	}
+	zram_wait_slot_inflight(zram, index);
 	zram_free_page(zram, index);
 
 	if (comp_len == PAGE_SIZE) {
