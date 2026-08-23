@@ -4822,6 +4822,7 @@ out:
 void hybridswap_untrack(struct zram *zram, u32 index)
 {
 	struct hyb_info *infos;
+	int retries;
 
 	if (!hybridswap_core_enabled())
 		return;
@@ -4830,11 +4831,29 @@ void hybridswap_untrack(struct zram *zram, u32 index)
 	if (!infos)
 		return;
 
+	/*
+	 * Wait out in-flight eswap operations claiming this slot; they
+	 * install their results under this lock.  Sleep instead of
+	 * spinning - the wait can span a full eswap IO - and rely on the
+	 * wake_up_var() calls at every site that clears either flag.
+	 */
+	retries = 0;
 	while (zram_test_flag(zram, index, ZRAM_UNDER_WB) ||
 			zram_test_flag(zram, index, ZRAM_BATCHING_OUT)) {
 		zram_slot_unlock(zram, index);
-		udelay(50);
+		wait_var_event_timeout(&zram->table[index].flags,
+			!(zram_test_flag(zram, index, ZRAM_UNDER_WB) ||
+			  zram_test_flag(zram, index, ZRAM_BATCHING_OUT)),
+			msecs_to_jiffies(5000));
 		zram_slot_lock(zram, index);
+		if (!(zram_test_flag(zram, index, ZRAM_UNDER_WB) ||
+		      zram_test_flag(zram, index, ZRAM_BATCHING_OUT)))
+			break;
+		if (++retries >= 2) {
+			/* Completer is stuck or gone; degrade loudly. */
+			WARN_ON_ONCE(1);
+			break;
+		}
 	}
 
 	hybridswap_swap_sorted_list_del(zram, index);
