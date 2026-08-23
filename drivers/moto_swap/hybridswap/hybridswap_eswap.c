@@ -2344,8 +2344,13 @@ int hybridswap_manager_init(struct zram *zram)
 		return 0;
 
 	hyb_info_detach(zram);
-	zram->infos = alloc_hyb_info(zram->disksize,
-					  zram->nr_pages << PAGE_SHIFT);
+	/*
+	 * Publish with release semantics: lockless readers via
+	 * hyb_info_get() must never observe this pointer before the
+	 * fully initialized tables it points at.
+	 */
+	rcu_assign_pointer(zram->infos, alloc_hyb_info(zram->disksize,
+					  zram->nr_pages << PAGE_SHIFT));
 	if (!zram->infos) {
 		ret = -ENOMEM;
 		goto out;
