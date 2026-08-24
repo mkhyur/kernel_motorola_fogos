@@ -964,9 +964,45 @@ ssize_t hybridswap_enable_store(struct device *dev,
 	return ret;
 }
 
+/*
+ * Expose the control files on both cgroup hierarchies without touching
+ * the cgroup core: the original tables are registered legacy-only (v1
+ * mounts) and private copies default-hierarchy-only (v2 unified mount).
+ * Same pattern blkcg used before 6.15 and the ANDROID GKI vendor memcg
+ * extensions; cgroup_add_dfl_cftypes() is a global declared in cgroup.h,
+ * linkable from built-in code (EXPORT only gates loadable modules).
+ */
+static struct cftype *hybridswap_dup_dfl_cftypes(const struct cftype *src)
+{
+	struct cftype *dst, *cft;
+	size_t nr = 1;
+
+	while (src[nr - 1].name[0])
+		nr++;
+
+	dst = kmemdup(src, nr * sizeof(*src), GFP_KERNEL);
+	if (!dst)
+		return NULL;
+
+	/*
+	 * The originals were stamped __CFTYPE_NOT_ON_DFL by their legacy
+	 * registration.  The copy must not inherit that bit, or
+	 * cgroup_addrm_files() would skip every entry on the default
+	 * hierarchy and no files would ever be created.
+	 */
+	for (cft = dst; cft->name[0]; cft++)
+		cft->flags &= ~__CFTYPE_NOT_ON_DFL;
+
+	return dst;
+}
+
 int __init hybridswap_pre_init(void)
 {
 	int ret;
+	struct cftype *hybs_dfl_files = NULL;
+#ifdef CONFIG_HYBRIDSWAP_SWAPD
+	struct cftype *swapd_dfl_files = NULL;
+#endif
 
 	INIT_LIST_HEAD(&grade_head);
 	log_level = HYB_INFO;
@@ -980,10 +1016,31 @@ int __init hybridswap_pre_init(void)
 		return ret;
 	}
 
+	/*
+	 * ROMs that mount only the unified hierarchy (no
+	 * /sys/fs/cgroup/memory) would never see legacy-only files,
+	 * leaving swapd without its watermarks and the per-app controls
+	 * unreachable.  Registration failure here is treated like the
+	 * original code did: fatal for hybridswap init.
+	 */
 	ret = cgroup_add_legacy_cftypes(&memory_cgrp_subsys,
 			mem_cgroup_hybridswap_legacy_files);
 	if (ret) {
 		hybp(HYB_INFO, "add mem_cgroup_hybridswap_legacy_files failed\n");
+		goto error_out;
+	}
+
+	hybs_dfl_files = hybridswap_dup_dfl_cftypes(
+			mem_cgroup_hybridswap_legacy_files);
+	if (!hybs_dfl_files) {
+		hybp(HYB_ERR, "dup mem_cgroup_hybridswap dfl files failed\n");
+		ret = -ENOMEM;
+		goto error_out;
+	}
+
+	ret = cgroup_add_dfl_cftypes(&memory_cgrp_subsys, hybs_dfl_files);
+	if (ret) {
+		hybp(HYB_INFO, "add mem_cgroup_hybridswap dfl files failed\n");
 		goto error_out;
 	}
 
@@ -992,6 +1049,20 @@ int __init hybridswap_pre_init(void)
 			mem_cgroup_swapd_legacy_files);
 	if (ret) {
 		hybp(HYB_INFO, "add mem_cgroup_swapd_legacy_files failed!\n");
+		goto error_out;
+	}
+
+	swapd_dfl_files = hybridswap_dup_dfl_cftypes(
+			mem_cgroup_swapd_legacy_files);
+	if (!swapd_dfl_files) {
+		hybp(HYB_ERR, "dup swapd dfl files failed\n");
+		ret = -ENOMEM;
+		goto error_out;
+	}
+
+	ret = cgroup_add_dfl_cftypes(&memory_cgrp_subsys, swapd_dfl_files);
+	if (ret) {
+		hybp(HYB_INFO, "add mem_cgroup_swapd dfl files failed!\n");
 		goto error_out;
 	}
 #endif
@@ -1011,6 +1082,10 @@ fail_out:
 	swapd_pre_deinit();
 #endif
 error_out:
+	kfree(hybs_dfl_files);
+#ifdef CONFIG_HYBRIDSWAP_SWAPD
+	kfree(swapd_dfl_files);
+#endif
 	if (hybridswap_cache) {
 		kmem_cache_destroy(hybridswap_cache);
 		hybridswap_cache = NULL;
