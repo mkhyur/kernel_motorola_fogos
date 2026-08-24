@@ -490,6 +490,7 @@ extern int hybridswap_core_enable(void);
 extern void hybridswap_core_disable(void);
 extern int hybridswap_psi_show(struct seq_file *m, void *v);
 extern void hybridswap_io_work_end(void);
+extern void hybridswap_exit_core(void);
 #else
 static inline unsigned long long hybridswap_read_mcg_stats(
         struct mem_cgroup *mcg, enum hybridswap_mcg_member mcg_member)
@@ -515,6 +516,7 @@ static inline bool hybridswap_reclaim_work_running(void)
 static inline bool hybridswap_core_enabled(void) { return false; }
 static inline bool hybridswap_out_to_eswap_enable(void) { return false; }
 static inline void hybridswap_io_work_end(void) {}
+static inline void hybridswap_exit_core(void) {}
 #endif
 
 #ifdef CONFIG_HYBRIDSWAP_SWAPD

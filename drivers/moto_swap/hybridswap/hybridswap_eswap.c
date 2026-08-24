@@ -4458,6 +4458,24 @@ void hybridswap_io_work_end(void)
 		hybridswap_global_setting_deinit();
 }
 
+/*
+ * Module-exit teardown for the core: stop new faults and reclaims,
+ * drain pending work, detach the per-device tables and release the
+ * bound loop device.  Safe on a never-enabled core.
+ */
+void hybridswap_exit_core(void)
+{
+	hybridswap_core_disable();
+
+	if (hyb_io_work_begin_flag || global_settings.stat)
+		hybridswap_io_work_end();
+
+	if (global_settings.zram) {
+		hybridswap_manager_deinit(global_settings.zram);
+		hybridswap_unbind_bdev(global_settings.zram);
+	}
+}
+
 struct workqueue_struct *hybridswap_fetch_reclaim_workqueue(void)
 {
 	return global_settings.reclaim_wq;

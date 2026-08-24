@@ -1122,8 +1122,12 @@ void __exit hybridswap_exit(void)
 	unregister_all_hook();
 
 #ifdef CONFIG_HYBRIDSWAP_SWAPD
+	if (hybridswap_swapd_enabled())
+		swapd_exit();
 	swapd_pre_deinit();
 #endif
+
+	hybridswap_exit_core();
 
 	if (hybs_dfl_files) {
 		cgroup_rm_cftypes(hybs_dfl_files);
@@ -1140,8 +1144,6 @@ void __exit hybridswap_exit(void)
 	}
 	cgroup_rm_cftypes(mem_cgroup_swapd_legacy_files);
 #endif
-
-	hybridswap_io_work_end();
 
 	if (hybridswap_cache) {
 		kmem_cache_destroy(hybridswap_cache);

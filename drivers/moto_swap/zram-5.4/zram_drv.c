@@ -819,6 +819,13 @@ static void reset_bdev(struct zram *zram)
 	zram->old_block_size = 0;
 	zram->bdev = NULL;
 }
+
+void hybridswap_unbind_bdev(struct zram *zram)
+{
+	down_write(&zram->init_lock);
+	reset_bdev(zram);
+	up_write(&zram->init_lock);
+}
 #else
 static inline void reset_bdev(struct zram *zram) {};
 #endif
