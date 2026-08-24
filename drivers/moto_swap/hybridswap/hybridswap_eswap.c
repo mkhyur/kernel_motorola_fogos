@@ -2092,7 +2092,15 @@ static int eswap_unlock(struct io_eswapent *io_eswap)
 	 * shrink_entry(), which keeps writers out (untrack waits for
 	 * the flag to clear) and makes hybridswap_delete() refuse them,
 	 * so nothing may legally change a slot while we work on it;
-	 * re-validate anyway and skip one whose state moved underneath.
+	 * re-validate anyway.
+	 *
+	 * The extent layout was packed at shrink time, so a slot that
+	 * dropped ZRAM_UNDER_WB mid-flight leaves a hole in that layout:
+	 * installing any later slot would point it at the wrong bytes.
+	 * Keep the contiguous prefix, stop, and release the remaining
+	 * slots back to plain zram - their compressed objects were never
+	 * touched, and a partially filled extent is harmless because only
+	 * installed slots are linked into the eswap map.
 	 */
 	for (k = 0; k < io_eswap->cnt; k++) {
 		u32 index = io_eswap->index[k];
@@ -2100,7 +2108,12 @@ static int eswap_unlock(struct io_eswapent *io_eswap)
 		zram_slot_lock(zram, index);
 		if (!zram_test_flag(zram, index, ZRAM_UNDER_WB)) {
 			zram_slot_unlock(zram, index);
-			continue;
+			/* Every clearer is accounted for; this is a bug. */
+			WARN_ON_ONCE(1);
+			hybp(HYB_ERR,
+			     "index %u lost UNDER_WB before install, keeping %d of %d slots\n",
+			     index, k, io_eswap->cnt);
+			break;
 		}
 		move_to_hybridswap(zram, index, eswpentry, mcg);
 		size = zram_get_obj_size(zram, index);
@@ -2108,6 +2121,18 @@ static int eswap_unlock(struct io_eswapent *io_eswap)
 		real_load += size;
 		zram_slot_unlock(zram, index);
 		wake_up_var(&zram->table[index].flags);
+	}
+	for (; k < io_eswap->cnt; k++) {
+		u32 index = io_eswap->index[k];
+
+		zram_slot_lock(zram, index);
+		if (zram_test_flag(zram, index, ZRAM_UNDER_WB)) {
+			zram_clear_flag(zram, index, ZRAM_UNDER_WB);
+			zram_slot_unlock(zram, index);
+			wake_up_var(&zram->table[index].flags);
+			continue;
+		}
+		zram_slot_unlock(zram, index);
 	}
 	put_eswap(zram->infos, eswapid);
 	io_eswap->eswapid = -EINVAL;
