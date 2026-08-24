@@ -1880,6 +1880,8 @@ static void update_size_info(struct zram *zram, u32 index)
 
 	if (!zram_test_flag(zram, index, ZRAM_IN_BD))
 		return;
+	if (!zram->infos)
+		return;
 
 	eswapid = esentry_extid(zram_get_handle(zram, index));
 	hybp(HYB_DEBUG, "eswapid %d index %d\n", eswapid, index);
@@ -2077,7 +2079,6 @@ static int eswap_unlock(struct io_eswapent *io_eswap)
 	if (eswapid < 0)
 		goto out;
 
-	eswapid = io_eswap->eswapid;
 	if (MEMCGRP_ITEM(mcg, in_swapin))
 		goto out;
 	hybp(HYB_DEBUG, "add eswapid = %d, cnt = %d.\n",
