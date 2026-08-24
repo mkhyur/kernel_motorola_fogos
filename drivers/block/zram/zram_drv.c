@@ -1749,7 +1749,7 @@ static ssize_t disksize_store(struct device *dev,
 	if (!disksize)
 		return -EINVAL;
 #else
-	disksize = (u64)SZ_1G * CONFIG_ZRAM_DEFAULT_DISKSIZE;
+	disksize = (u64)SZ_1M * CONFIG_ZRAM_DEFAULT_DISKSIZE;
 	pr_info("Setting default zram disksize to %llu bytes\n", disksize);
 #endif
 
