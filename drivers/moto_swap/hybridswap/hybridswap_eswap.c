@@ -4413,6 +4413,25 @@ void hybridswap_global_setting_deinit(void)
 	global_settings.reclaim_wq = NULL;
 }
 
+/*
+ * Tear down everything hyb_io_work_begin() and
+ * hybridswap_global_setting_init() created.  stat and reclaim_wq are
+ * created together, so stat != NULL implies reclaim_wq != NULL.
+ */
+void hybridswap_io_work_end(void)
+{
+	if (hyb_io_work_begin_flag) {
+		destroy_workqueue(hybridswap_proc_read_workqueue);
+		destroy_workqueue(hybridswap_proc_write_workqueue);
+		hybridswap_proc_read_workqueue = NULL;
+		hybridswap_proc_write_workqueue = NULL;
+		hyb_io_work_begin_flag = false;
+	}
+
+	if (global_settings.stat)
+		hybridswap_global_setting_deinit();
+}
+
 struct workqueue_struct *hybridswap_fetch_reclaim_workqueue(void)
 {
 	return global_settings.reclaim_wq;

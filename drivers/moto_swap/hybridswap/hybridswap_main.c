@@ -965,6 +965,15 @@ ssize_t hybridswap_enable_store(struct device *dev,
 }
 
 /*
+ * Duplicated default-hierarchy tables, kept around for
+ * cgroup_rm_cftypes() on the error and exit paths.
+ */
+static struct cftype *hybs_dfl_files;
+#ifdef CONFIG_HYBRIDSWAP_SWAPD
+static struct cftype *swapd_dfl_files;
+#endif
+
+/*
  * Expose the control files on both cgroup hierarchies without touching
  * the cgroup core: the original tables are registered legacy-only (v1
  * mounts) and private copies default-hierarchy-only (v2 unified mount).
@@ -999,9 +1008,9 @@ static struct cftype *hybridswap_dup_dfl_cftypes(const struct cftype *src)
 int __init hybridswap_pre_init(void)
 {
 	int ret;
-	struct cftype *hybs_dfl_files = NULL;
+	bool hybs_legacy_added = false, hybs_dfl_added = false;
 #ifdef CONFIG_HYBRIDSWAP_SWAPD
-	struct cftype *swapd_dfl_files = NULL;
+	bool swapd_legacy_added = false, swapd_dfl_added = false;
 #endif
 
 	INIT_LIST_HEAD(&grade_head);
@@ -1029,6 +1038,7 @@ int __init hybridswap_pre_init(void)
 		hybp(HYB_INFO, "add mem_cgroup_hybridswap_legacy_files failed\n");
 		goto error_out;
 	}
+	hybs_legacy_added = true;
 
 	hybs_dfl_files = hybridswap_dup_dfl_cftypes(
 			mem_cgroup_hybridswap_legacy_files);
@@ -1043,6 +1053,7 @@ int __init hybridswap_pre_init(void)
 		hybp(HYB_INFO, "add mem_cgroup_hybridswap dfl files failed\n");
 		goto error_out;
 	}
+	hybs_dfl_added = true;
 
 #ifdef CONFIG_HYBRIDSWAP_SWAPD
 	ret = cgroup_add_legacy_cftypes(&memory_cgrp_subsys,
@@ -1051,6 +1062,7 @@ int __init hybridswap_pre_init(void)
 		hybp(HYB_INFO, "add mem_cgroup_swapd_legacy_files failed!\n");
 		goto error_out;
 	}
+	swapd_legacy_added = true;
 
 	swapd_dfl_files = hybridswap_dup_dfl_cftypes(
 			mem_cgroup_swapd_legacy_files);
@@ -1065,6 +1077,7 @@ int __init hybridswap_pre_init(void)
 		hybp(HYB_INFO, "add mem_cgroup_swapd dfl files failed!\n");
 		goto error_out;
 	}
+	swapd_dfl_added = true;
 #endif
 
 #ifdef CONFIG_HYBRIDSWAP_SWAPD
@@ -1082,10 +1095,21 @@ fail_out:
 	swapd_pre_deinit();
 #endif
 error_out:
-	kfree(hybs_dfl_files);
+	/* unwind in reverse registration order */
 #ifdef CONFIG_HYBRIDSWAP_SWAPD
+	if (swapd_dfl_added)
+		cgroup_rm_cftypes(swapd_dfl_files);
 	kfree(swapd_dfl_files);
+	swapd_dfl_files = NULL;
+	if (swapd_legacy_added)
+		cgroup_rm_cftypes(mem_cgroup_swapd_legacy_files);
 #endif
+	if (hybs_dfl_added)
+		cgroup_rm_cftypes(hybs_dfl_files);
+	kfree(hybs_dfl_files);
+	hybs_dfl_files = NULL;
+	if (hybs_legacy_added)
+		cgroup_rm_cftypes(mem_cgroup_hybridswap_legacy_files);
 	if (hybridswap_cache) {
 		kmem_cache_destroy(hybridswap_cache);
 		hybridswap_cache = NULL;
@@ -1100,6 +1124,24 @@ void __exit hybridswap_exit(void)
 #ifdef CONFIG_HYBRIDSWAP_SWAPD
 	swapd_pre_deinit();
 #endif
+
+	if (hybs_dfl_files) {
+		cgroup_rm_cftypes(hybs_dfl_files);
+		kfree(hybs_dfl_files);
+		hybs_dfl_files = NULL;
+	}
+	cgroup_rm_cftypes(mem_cgroup_hybridswap_legacy_files);
+
+#ifdef CONFIG_HYBRIDSWAP_SWAPD
+	if (swapd_dfl_files) {
+		cgroup_rm_cftypes(swapd_dfl_files);
+		kfree(swapd_dfl_files);
+		swapd_dfl_files = NULL;
+	}
+	cgroup_rm_cftypes(mem_cgroup_swapd_legacy_files);
+#endif
+
+	hybridswap_io_work_end();
 
 	if (hybridswap_cache) {
 		kmem_cache_destroy(hybridswap_cache);
