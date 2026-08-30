@@ -1,0 +1,370 @@
+name: Build Moto G45 - KernelSU 3.3.0 + SUSFS 1.5.5
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: "kernel_motorola_fogos branch/commit (default = known-working 5.4.295 base)"
+        required: true
+        default: "f9da9c37db69"
+      ksu_ref:
+        description: "Official tiann/KernelSU tag/commit"
+        required: true
+        default: "v3.3.0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: g45-kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    env:
+      KERNEL_REPO: https://github.com/prabhatkrmishra/kernel_motorola_fogos.git
+      KERNEL_REF: ${{ inputs.kernel_ref }}
+      KSU_REF: ${{ inputs.ksu_ref }}
+      KSU_REPO: https://github.com/tiann/KernelSU.git
+      SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
+      SUSFS_BRANCH: kernel-5.4
+      OUT: ${{ github.workspace }}/kernel/out
+      ARCH: arm64
+      SUBARCH: arm64
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex git libelf-dev libssl-dev \
+            libncurses-dev lld llvm make python3 rsync unzip zip xz-utils zstd \
+            device-tree-compiler gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Clone kernel source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git init kernel
+          git -C kernel remote add origin "$KERNEL_REPO"
+          git -C kernel fetch --depth=1 origin "$KERNEL_REF"
+          git -C kernel checkout --detach FETCH_HEAD
+
+          echo "Kernel source commit: $(git -C kernel rev-parse HEAD)"
+          grep -E '^VERSION|^PATCHLEVEL|^SUBLEVEL' kernel/Makefile | head -n 3
+
+      - name: Download Android 11 kernel toolchains
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p toolchains
+
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b.git \
+            toolchains/clang
+
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
+            toolchains/gcc64
+
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git \
+            toolchains/gcc32
+
+          test -x toolchains/clang/bin/clang
+          toolchains/clang/bin/clang --version | head -n 1
+
+      - name: Replace old KSU/KernelSU-Next with official KernelSU
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+
+          # Remove the KSU implementation tracked by the Motorola fork.
+          rm -rf KernelSU KernelSU-Next drivers/kernelsu
+
+          # Clone OFFICIAL KernelSU (tiann/KernelSU), not KernelSU-Next.
+          git clone "$KSU_REPO" KernelSU
+          git -C KernelSU checkout --detach "$KSU_REF"
+          echo "KernelSU: $(git -C KernelSU describe --tags --always) @ $(git -C KernelSU rev-parse --short HEAD)"
+
+          # KernelSU >= 1.0 dropped the old non-GKI/manual-hook integration.
+          # This Linux 5.4 Motorola tree already contains the legacy hook sites,
+          # so restore the removed compatibility layer into the modern KSU tree.
+          DROP_NON_GKI=898e9d4
+          git -C KernelSU cat-file -e "${DROP_NON_GKI}^{commit}"
+          git -C KernelSU show --format= --binary "$DROP_NON_GKI" -- kernel > /tmp/drop-non-gki.patch
+
+          # Apply the inverse as a 3-way merge against v3.3.0.
+          # If upstream changed the same code incompatibly, STOP rather than
+          # silently producing a kernel with broken root.
+          if ! git -C KernelSU apply -R --3way /tmp/drop-non-gki.patch; then
+            echo "::error::KernelSU $KSU_REF changed too much for the non-GKI backport. Resolve the 898e9d4 reverse patch before flashing anything."
+            exit 1
+          fi
+          git -C KernelSU config user.name "github-actions"
+          git -C KernelSU config user.email "github-actions@users.noreply.github.com"
+          git -C KernelSU add -A
+          git -C KernelSU commit -m "Backport KernelSU non-GKI kernel support"
+
+          # Wire KernelSU as drivers/kernelsu.
+          ln -s ../KernelSU/kernel drivers/kernelsu
+          grep -q 'obj-$(CONFIG_KSU).*kernelsu/' drivers/Makefile || \
+            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || \
+            sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+
+          # Manual-hook build: do not make CONFIG_KSU depend on KPROBES.
+          # Keep EXT4_FS dependency if present in the modern Kconfig.
+          sed -i -E 's/depends on KPROBES && EXT4_FS/depends on EXT4_FS/' KernelSU/kernel/Kconfig
+          sed -i -E 's/depends on KPROBES$/depends on EXT4_FS/' KernelSU/kernel/Kconfig
+
+      - name: Integrate SUSFS 1.5.5 for Linux 5.4
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+
+          git clone --depth=1 --branch "$SUSFS_BRANCH" "$SUSFS_REPO" susfs4ksu
+
+          SUS_VER=$(grep -E '^#define SUSFS_VERSION' susfs4ksu/kernel_patches/include/linux/susfs.h | awk '{print $3}' | tr -d '"' || true)
+          echo "SUSFS branch reports: ${SUS_VER:-unknown}"
+
+          # The fogos source used by the known-working ZIP already contains the
+          # Linux-5.4 SUSFS kernel-side integration. Refresh the implementation
+          # files from the maintained 5.4 branch. If the tree does NOT contain
+          # SUSFS yet, apply the full kernel-side patch.
+          if grep -q 'SUSFS_VERSION' include/linux/susfs.h 2>/dev/null; then
+            echo "Existing SUSFS kernel integration detected; refreshing SUSFS sources."
+            cp -f susfs4ksu/kernel_patches/fs/susfs.c fs/susfs.c
+            cp -f susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/susfs.h
+            if compgen -G 'susfs4ksu/kernel_patches/include/linux/susfs*.h' > /dev/null; then
+              cp -f susfs4ksu/kernel_patches/include/linux/susfs*.h include/linux/ || true
+            fi
+          else
+            echo "No SUSFS integration detected; applying Linux 5.4 kernel patch."
+            cp -f susfs4ksu/kernel_patches/fs/* fs/
+            cp -f susfs4ksu/kernel_patches/include/linux/* include/linux/
+            git apply --3way susfs4ksu/kernel_patches/50_add_susfs_in_kernel-5.4.patch
+          fi
+
+          # Apply the SUSFS-to-KernelSU glue. 3-way is intentional because the
+          # 5.4 SUSFS branch targets an older KSU layout while we are backporting
+          # it onto official KernelSU 3.3.0.
+          cp susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch /tmp/10_enable_susfs_for_ksu.patch
+          if ! git -C KernelSU apply --3way /tmp/10_enable_susfs_for_ksu.patch; then
+            echo "::error::SUSFS 5.4 KSU-side patch conflicts with official KernelSU $KSU_REF. Do not flash a partial build."
+            exit 1
+          fi
+
+          grep -E '^#define SUSFS_VERSION' include/linux/susfs.h || true
+
+      - name: Prepare fogos configuration
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+          mkdir -p "$OUT"
+
+          cat > /tmp/g45-ksu-susfs.config <<'EOF'
+          CONFIG_KSU=y
+          # CONFIG_KSU_DEBUG is not set
+
+          # Manual/non-kprobe integration for this 5.4 tree.
+          # CONFIG_KPROBES is not set
+
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+
+          # SUS_SU must be disabled when the kernel already uses KernelSU's
+          # non-kprobe/manual hook patches (upstream SUSFS requirement).
+          # CONFIG_KSU_SUSFS_SUS_SU is not set
+
+          CONFIG_OVERLAY_FS=y
+          CONFIG_TMPFS_XATTR=y
+          EOF
+
+          BASE1=arch/arm64/configs/vendor/genericarmv8-64_defconfig
+          BASE2=arch/arm64/configs/vendor/moto-consolidate.config
+          BASE3=arch/arm64/configs/vendor/ext_config/moto-holi.config
+          BASE4=arch/arm64/configs/vendor/ext_config/moto-holi-fogos.config
+
+          for f in "$BASE1" "$BASE2" "$BASE3" "$BASE4"; do
+            test -f "$f" || { echo "::error::Missing config: $f"; exit 1; }
+          done
+
+          ./scripts/kconfig/merge_config.sh -m -O "$OUT" \
+            "$BASE1" "$BASE2" "$BASE3" "$BASE4" /tmp/g45-ksu-susfs.config
+
+      - name: Finalize and verify .config
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+          export PATH="$GITHUB_WORKSPACE/toolchains/clang/bin:$GITHUB_WORKSPACE/toolchains/gcc64/bin:$GITHUB_WORKSPACE/toolchains/gcc32/bin:$PATH"
+          export CROSS_COMPILE=aarch64-linux-android-
+          export CROSS_COMPILE_ARM32=arm-linux-androideabi-
+
+          make O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+
+          echo "===== Required config ====="
+          grep -E '^(CONFIG_KSU=|CONFIG_KSU_SUSFS=|CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=|CONFIG_KSU_SUSFS_SUS_MOUNT=|CONFIG_KSU_SUSFS_SUS_KSTAT=|CONFIG_KSU_SUSFS_SUS_OVERLAYFS=|CONFIG_KSU_SUSFS_TRY_UMOUNT=|CONFIG_KSU_SUSFS_SPOOF_UNAME=|CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=|CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=|CONFIG_KSU_SUSFS_OPEN_REDIRECT=|CONFIG_OVERLAY_FS=)' "$OUT/.config" || true
+
+          required=(
+            CONFIG_KSU=y
+            CONFIG_KSU_SUSFS=y
+            CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
+            CONFIG_KSU_SUSFS_SUS_MOUNT=y
+            CONFIG_KSU_SUSFS_SUS_KSTAT=y
+            CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          )
+          for opt in "${required[@]}"; do
+            grep -qx "$opt" "$OUT/.config" || {
+              echo "::error::Required option was lost after olddefconfig: $opt"
+              exit 1
+            }
+          done
+
+          grep -qx '# CONFIG_KPROBES is not set' "$OUT/.config" || {
+            echo "::warning::KPROBES ended up enabled. This workflow is intended for the fogos manual-hook path."
+          }
+
+      - name: Build kernel Image
+        shell: bash
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+          export PATH="$GITHUB_WORKSPACE/toolchains/clang/bin:$GITHUB_WORKSPACE/toolchains/gcc64/bin:$GITHUB_WORKSPACE/toolchains/gcc32/bin:$PATH"
+          export CROSS_COMPILE=aarch64-linux-android-
+          export CROSS_COMPILE_ARM32=arm-linux-androideabi-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export KBUILD_BUILD_USER=github-actions
+          export KBUILD_BUILD_HOST=kernel-g45
+          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+          ccache -M 2G
+
+          make -j"$(nproc)" \
+            O="$OUT" \
+            ARCH=arm64 \
+            LLVM=1 LLVM_IAS=1 \
+            CC="ccache clang" \
+            Image
+
+          test -s "$OUT/arch/arm64/boot/Image"
+          file "$OUT/arch/arm64/boot/Image"
+          sha256sum "$OUT/arch/arm64/boot/Image" | tee "$GITHUB_WORKSPACE/Image.sha256"
+
+      - name: Package flashable AnyKernel3 ZIP
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          rm -rf AnyKernel3/.git AnyKernel3/.github
+
+          cp kernel/out/arch/arm64/boot/Image AnyKernel3/Image
+
+          cat > AnyKernel3/anykernel.sh <<'EOF'
+          # AnyKernel3 Ramdisk Mod Script
+          # osm0sis @ xda-developers
+
+          properties() { '
+          kernel.string=G45 KernelSU 3.3.0 + SUSFS 1.5.5
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=
+          device.name2=
+          device.name3=
+          device.name4=
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          '; }
+
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          dump_boot;
+          write_boot;
+          EOF
+
+          cd AnyKernel3
+          zip -r9 ../G45-KernelSU-${KSU_REF}-SUSFS-1.5.5.zip . \
+            -x '*.git*' 'README.md' '*placeholder'
+          cd ..
+
+          sha256sum G45-KernelSU-${KSU_REF}-SUSFS-1.5.5.zip | tee G45-KernelSU-${KSU_REF}-SUSFS-1.5.5.zip.sha256
+
+      - name: Save build metadata
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "kernel_repo=$KERNEL_REPO"
+            echo "kernel_ref=$KERNEL_REF"
+            if [ -d kernel/.git ]; then echo "kernel_commit=$(git -C kernel rev-parse HEAD)"; fi
+            echo "ksu_repo=$KSU_REPO"
+            echo "ksu_ref=$KSU_REF"
+            if [ -d kernel/KernelSU/.git ]; then echo "ksu_commit=$(git -C kernel/KernelSU rev-parse HEAD)"; fi
+            echo "susfs_repo=$SUSFS_REPO"
+            echo "susfs_branch=$SUSFS_BRANCH"
+            if [ -f kernel/include/linux/susfs.h ]; then grep -E '^#define SUSFS_VERSION' kernel/include/linux/susfs.h || true; fi
+          } | tee build-info.txt
+
+          if [ -f kernel/out/.config ]; then
+            cp kernel/out/.config kernel-config.txt
+          fi
+
+      - name: Upload flashable ZIP
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: G45-KernelSU-${{ inputs.ksu_ref }}-SUSFS
+          path: |
+            G45-KernelSU-${{ inputs.ksu_ref }}-SUSFS-1.5.5.zip
+            G45-KernelSU-${{ inputs.ksu_ref }}-SUSFS-1.5.5.zip.sha256
+            Image.sha256
+            build-info.txt
+            kernel-config.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: G45-build-diagnostics
+          path: |
+            build-info.txt
+            kernel-config.txt
+            kernel/KernelSU/*.rej
+            kernel/KernelSU/kernel/*.rej
+            kernel/*.rej
+          if-no-files-found: ignore
+          retention-days: 7
