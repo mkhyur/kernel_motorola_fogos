@@ -6,7 +6,7 @@ on:
       kernel_ref:
         description: "kernel_motorola_fogos branch/commit (default = known-working 5.4.295 base)"
         required: true
-        default: "f9da9c37db69"
+        default: "f9da9c37db694ea5af421e0bccfda6d1ec2d6e3b"
       ksu_ref:
         description: "Official tiann/KernelSU tag/commit"
         required: true
@@ -51,12 +51,44 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+          rm -rf kernel
           git init kernel
           git -C kernel remote add origin "$KERNEL_REPO"
-          git -C kernel fetch --depth=1 origin "$KERNEL_REF"
+
+          # GitHub's upload-pack does not treat an abbreviated commit SHA as a
+          # remote ref. Expand the known-working fogos SHA if an older workflow
+          # dispatch still sends the abbreviated value.
+          RESOLVED_KERNEL_REF="$KERNEL_REF"
+          case "$RESOLVED_KERNEL_REF" in
+            f9da9c37db69)
+              RESOLVED_KERNEL_REF="f9da9c37db694ea5af421e0bccfda6d1ec2d6e3b"
+              ;;
+          esac
+
+          echo "Requested kernel_ref: $KERNEL_REF"
+          echo "Resolved kernel_ref:  $RESOLVED_KERNEL_REF"
+
+          # Full 40-char SHAs, branches and tags are accepted here. If someone
+          # supplies another abbreviated SHA, stop with a useful error instead
+          # of the misleading 'couldn't find remote ref' message.
+          if [[ "$RESOLVED_KERNEL_REF" =~ ^[0-9a-fA-F]{7,39}$ ]]; then
+            echo "::error::kernel_ref is an abbreviated SHA ($RESOLVED_KERNEL_REF). Use the full 40-character SHA."
+            exit 1
+          fi
+
+          git -C kernel fetch --no-tags --depth=1 origin "$RESOLVED_KERNEL_REF"
           git -C kernel checkout --detach FETCH_HEAD
 
-          echo "Kernel source commit: $(git -C kernel rev-parse HEAD)"
+          ACTUAL_KERNEL_SHA="$(git -C kernel rev-parse HEAD)"
+          echo "Kernel source commit: $ACTUAL_KERNEL_SHA"
+
+          # Guard against accidentally building a different revision when the
+          # input was a full SHA.
+          if [[ "$RESOLVED_KERNEL_REF" =~ ^[0-9a-fA-F]{40}$ ]] && \
+             [[ "${ACTUAL_KERNEL_SHA,,}" != "${RESOLVED_KERNEL_REF,,}" ]]; then
+            echo "::error::Fetched SHA does not match requested kernel_ref."
+            exit 1
+          fi
           grep -E '^VERSION|^PATCHLEVEL|^SUBLEVEL' kernel/Makefile | head -n 3
 
       - name: Download Android 11 kernel toolchains
