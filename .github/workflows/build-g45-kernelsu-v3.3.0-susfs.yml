@@ -18,7 +18,7 @@ jobs:
 
       # Official KernelSU Next.
       KSU_REPO: https://github.com/KernelSU-Next/KernelSU-Next.git
-      KSU_REF: legacy_susfs
+      KSU_REF: legacy
 
       # SUSFS kernel 5.4 upstream.
       SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
@@ -77,8 +77,16 @@ jobs:
           # ============================================================
           rm -rf KernelSU-Next drivers/kernelsu
 
-          git clone --depth=1 --branch "${KSU_REF}" \
+          info "Verificando branch KernelSU Next: ${KSU_REF}"
+          if ! git ls-remote --exit-code --heads "${KSU_REPO}" "${KSU_REF}" >/dev/null 2>&1; then
+            die "Branch ${KSU_REF} não existe em ${KSU_REPO}"
+          fi
+
+          git clone --depth=1 --single-branch --branch "${KSU_REF}" \
             "${KSU_REPO}" KernelSU-Next
+
+          [ -d KernelSU-Next/.git ] || \
+            die "Clone do KernelSU Next falhou"
 
           [ -f KernelSU-Next/kernel/Kconfig ] || \
             die "KernelSU Next kernel/Kconfig não encontrado"
