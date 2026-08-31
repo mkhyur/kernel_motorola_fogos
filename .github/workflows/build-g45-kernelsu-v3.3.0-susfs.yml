@@ -1,4 +1,4 @@
-name: Build fogos - KSUN + SUSFS + MetaModule PREINTEGRATED
+name: Build fogos - KSUN + SUSFS + MetaModule V4
 
 on:
   workflow_dispatch:
@@ -331,10 +331,14 @@ jobs:
           device.name1=fogos
           '; }
 
-          block=/dev/block/bootdevice/by-name/boot;
-          is_slot_device=1;
-          ramdisk_compression=auto;
-          patch_vbmeta_flag=auto;
+          # AnyKernel3 current variable names are uppercase.
+          # BLOCK=boot lets AK3 search common by-name paths automatically.
+          # IS_SLOT_DEVICE=auto detects A/B slot suffix when present.
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+          SLOT_SELECT=active;
 
           . tools/ak3-core.sh;
 
@@ -344,7 +348,10 @@ jobs:
 
           chmod 755 AnyKernel3/anykernel.sh
 
-          ZIP="fogos-KSUN-SUSFS-MetaModule-PREINTEGRATED-AnyKernel3.zip"
+          grep -q 'BLOCK=boot' AnyKernel3/anykernel.sh || die "AnyKernel3 BLOCK não configurado"
+          grep -q 'IS_SLOT_DEVICE=auto' AnyKernel3/anykernel.sh || die "AnyKernel3 slot auto não configurado"
+
+          ZIP="fogos-KSUN-SUSFS-MetaModule-V4-AnyKernel3.zip"
 
           (
             cd AnyKernel3
@@ -363,9 +370,9 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: fogos-KSUN-SUSFS-MetaModule-PREINTEGRATED
+          name: fogos-KSUN-SUSFS-MetaModule-V4
           path: |
-            fogos-KSUN-SUSFS-MetaModule-PREINTEGRATED-AnyKernel3.zip
+            fogos-KSUN-SUSFS-MetaModule-V4-AnyKernel3.zip
             fogos-final.config
             build.log
           retention-days: 14
