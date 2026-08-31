@@ -1,4 +1,4 @@
-name: Build fogos - KSUN + SUSFS + MetaModule V4
+name: Build fogos - KSUN Legacy Latest + SUSFS + MetaModule V5
 
 on:
   workflow_dispatch:
@@ -66,23 +66,38 @@ jobs:
           ok "SUSFS já integrado na árvore"
 
           # ------------------------------------------------------------
-          # Use the KernelSU Next version pinned by the kernel tree.
-          # Do NOT replace it with another branch/tag: this prevents
-          # SUSFS/KSU source-version mismatch.
+          # KernelSU Next - latest LEGACY branch
+          #
+          # fogos is Linux 5.4. Use the legacy line instead of main/v3.3.0.
+          # Current legacy builds are in the 3319x range and satisfy
+          # managers requiring >= 33188.
           # ------------------------------------------------------------
-          [ -d KernelSU-Next ] || die "Submódulo KernelSU-Next não foi baixado"
+          rm -rf KernelSU-Next drivers/kernelsu
+
+          KSU_REPO="https://github.com/KernelSU-Next/KernelSU-Next.git"
+          KSU_BRANCH="legacy"
+
+          info "Baixando o KernelSU Next mais novo do branch ${KSU_BRANCH}"
+
+          git ls-remote --exit-code --heads "${KSU_REPO}" "${KSU_BRANCH}" >/dev/null 2>&1 || \
+            die "Branch ${KSU_BRANCH} não encontrado no KernelSU Next oficial"
+
+          git clone --depth=1 --single-branch --branch "${KSU_BRANCH}" \
+            "${KSU_REPO}" KernelSU-Next
+
           [ -f KernelSU-Next/kernel/Kconfig ] || die "KernelSU-Next/kernel/Kconfig ausente"
           [ -f KernelSU-Next/kernel/Kbuild ] || die "KernelSU-Next/kernel/Kbuild ausente"
 
-          echo "KernelSU Next pin:"
-          git -C KernelSU-Next rev-parse --short HEAD
+          KSU_COMMIT="$(git -C KernelSU-Next rev-parse HEAD)"
+          KSU_SHORT="$(git -C KernelSU-Next rev-parse --short HEAD)"
+          echo "KernelSU Next legacy commit: ${KSU_COMMIT}"
           git -C KernelSU-Next log -1 --oneline || true
 
           rm -rf drivers/kernelsu
           ln -s ../KernelSU-Next/kernel drivers/kernelsu
 
           [ -f drivers/kernelsu/Kconfig ] || die "Symlink KernelSU inválido"
-          ok "KernelSU Next integrado"
+          ok "KernelSU Next legacy mais novo integrado: ${KSU_SHORT}"
 
           # ------------------------------------------------------------
           # Toolchain known for this Motorola 5.4 generation
@@ -261,6 +276,12 @@ jobs:
 
           cp "${OUT}/.config" fogos-final.config
 
+          {
+            echo "branch=legacy"
+            echo "commit=${KSU_COMMIT}"
+            echo "short=${KSU_SHORT}"
+          } > kernelsu-next-version.txt
+
           echo
           echo "========== CONFIG SELECIONADA =========="
           grep -E \
@@ -302,6 +323,23 @@ jobs:
 
           IMAGE="${OUT}/arch/arm64/boot/Image"
           [ -s "${IMAGE}" ] || die "Image não foi criada"
+
+          # KernelSU prints its version during Kbuild. Require a driver
+          # new enough for current manager compatibility.
+          KSU_NUM="$(grep -Eo 'KernelSU-Next version: *[0-9]+' build.log | tail -1 | grep -Eo '[0-9]+' || true)"
+          KSU_TAG="$(grep -Eo 'KernelSU-Next tag: *[^[:space:]]+' build.log | tail -1 | sed 's/.*tag: *//' || true)"
+
+          if [ -n "${KSU_NUM}" ]; then
+            echo "KernelSU Next driver version detectada: ${KSU_NUM}"
+            [ -n "${KSU_TAG}" ] && echo "KernelSU Next tag detectada: ${KSU_TAG}"
+
+            if [ "${KSU_NUM}" -lt 33188 ]; then
+              die "KernelSU Next ${KSU_NUM} é menor que 33188; ZIP bloqueado para evitar incompatibilidade com o Manager."
+            fi
+            ok "KernelSU Next >= 33188"
+          else
+            info "O Kbuild não imprimiu o número do driver; commit usado: ${KSU_COMMIT}"
+          fi
 
           ok "Image compilada"
           ls -lh "${IMAGE}"
@@ -351,7 +389,7 @@ jobs:
           grep -q 'BLOCK=boot' AnyKernel3/anykernel.sh || die "AnyKernel3 BLOCK não configurado"
           grep -q 'IS_SLOT_DEVICE=auto' AnyKernel3/anykernel.sh || die "AnyKernel3 slot auto não configurado"
 
-          ZIP="fogos-KSUN-SUSFS-MetaModule-V4-AnyKernel3.zip"
+          ZIP="fogos-KSUN-Legacy-Latest-SUSFS-MetaModule-V5-AnyKernel3.zip"
 
           (
             cd AnyKernel3
@@ -370,9 +408,10 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: fogos-KSUN-SUSFS-MetaModule-V4
+          name: fogos-KSUN-Legacy-Latest-SUSFS-MetaModule-V5
           path: |
-            fogos-KSUN-SUSFS-MetaModule-V4-AnyKernel3.zip
+            fogos-KSUN-Legacy-Latest-SUSFS-MetaModule-V5-AnyKernel3.zip
             fogos-final.config
+            kernelsu-next-version.txt
             build.log
           retention-days: 14
