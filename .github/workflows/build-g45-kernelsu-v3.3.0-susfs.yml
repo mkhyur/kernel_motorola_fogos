@@ -1,4 +1,4 @@
-name: Build fogos - KSUN Legacy Latest + SUSFS + MetaModule V5
+name: Build fogos - KSUN Legacy SUSFS v2 + MetaModule V6
 
 on:
   workflow_dispatch:
@@ -66,16 +66,16 @@ jobs:
           ok "SUSFS já integrado na árvore"
 
           # ------------------------------------------------------------
-          # KernelSU Next - latest LEGACY branch
+          # KernelSU Next - legacy-susfs-v2
           #
-          # fogos is Linux 5.4. Use the legacy line instead of main/v3.3.0.
-          # Current legacy builds are in the 3319x range and satisfy
-          # managers requiring >= 33188.
+          # fogos is Linux 5.4 and needs the legacy line.
+          # This branch already integrates SUSFS v2 on the KernelSU side,
+          # avoiding CONFIG_KSU_SUSFS being discarded by olddefconfig.
           # ------------------------------------------------------------
           rm -rf KernelSU-Next drivers/kernelsu
 
-          KSU_REPO="https://github.com/KernelSU-Next/KernelSU-Next.git"
-          KSU_BRANCH="legacy"
+          KSU_REPO="https://github.com/DXRN-MoonWake/KernelSU-Next.git"
+          KSU_BRANCH="legacy-susfs-v2"
 
           info "Baixando o KernelSU Next mais novo do branch ${KSU_BRANCH}"
 
@@ -87,6 +87,11 @@ jobs:
 
           [ -f KernelSU-Next/kernel/Kconfig ] || die "KernelSU-Next/kernel/Kconfig ausente"
           [ -f KernelSU-Next/kernel/Kbuild ] || die "KernelSU-Next/kernel/Kbuild ausente"
+
+          grep -Rqs 'config KSU_SUSFS' KernelSU-Next/kernel || \
+            die "Este branch não contém config KSU_SUSFS; build bloqueado antes do olddefconfig"
+
+          ok "KernelSU Next contém integração KSU_SUSFS"
 
           KSU_COMMIT="$(git -C KernelSU-Next rev-parse HEAD)"
           KSU_SHORT="$(git -C KernelSU-Next rev-parse --short HEAD)"
@@ -277,7 +282,7 @@ jobs:
           cp "${OUT}/.config" fogos-final.config
 
           {
-            echo "branch=legacy"
+            echo "branch=legacy-susfs-v2"
             echo "commit=${KSU_COMMIT}"
             echo "short=${KSU_SHORT}"
           } > kernelsu-next-version.txt
@@ -389,7 +394,7 @@ jobs:
           grep -q 'BLOCK=boot' AnyKernel3/anykernel.sh || die "AnyKernel3 BLOCK não configurado"
           grep -q 'IS_SLOT_DEVICE=auto' AnyKernel3/anykernel.sh || die "AnyKernel3 slot auto não configurado"
 
-          ZIP="fogos-KSUN-Legacy-Latest-SUSFS-MetaModule-V5-AnyKernel3.zip"
+          ZIP="fogos-KSUN-Legacy-SUSFSv2-MetaModule-V6-AnyKernel3.zip"
 
           (
             cd AnyKernel3
@@ -408,9 +413,9 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: fogos-KSUN-Legacy-Latest-SUSFS-MetaModule-V5
+          name: fogos-KSUN-Legacy-SUSFSv2-MetaModule-V6
           path: |
-            fogos-KSUN-Legacy-Latest-SUSFS-MetaModule-V5-AnyKernel3.zip
+            fogos-KSUN-Legacy-SUSFSv2-MetaModule-V6-AnyKernel3.zip
             fogos-final.config
             kernelsu-next-version.txt
             build.log
