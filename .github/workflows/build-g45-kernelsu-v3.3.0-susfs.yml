@@ -1,337 +1,544 @@
-name: Build Moto G45 - KernelSU 3.3.0 + SUSFS 1.5.5
+name: Build fogos - KernelSU Next - No SUSFS - Strict Stock Stability - No OverlayFS v11.0
 
 on:
   workflow_dispatch:
-    inputs:
-      kernel_ref:
-        description: "kernel_motorola_fogos branch/commit (default = known-working 5.4.295 base)"
-        required: true
-        default: "f9da9c37db694ea5af421e0bccfda6d1ec2d6e3b"
-      ksu_ref:
-        description: "Official tiann/KernelSU tag/commit"
-        required: true
-        default: "v3.3.0"
-
-permissions:
-  contents: read
-
-concurrency:
-  group: g45-kernel-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
+    timeout-minutes: 120
 
     env:
-      KERNEL_REPO: https://github.com/prabhatkrmishra/kernel_motorola_fogos.git
-      KERNEL_REF: ${{ inputs.kernel_ref }}
-      KSU_REF: ${{ inputs.ksu_ref }}
-      KSU_REPO: https://github.com/tiann/KernelSU.git
-      SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
-      SUSFS_BRANCH: kernel-5.4
-      OUT: ${{ github.workspace }}/kernel/out
       ARCH: arm64
       SUBARCH: arm64
+      OUT_DIR: out
+      STOCK_CONFIG: arch/arm64/configs/vendor/fogos_stock-config
+      FOGOS_FRAGMENT: arch/arm64/configs/vendor/ext_config/moto-holi-fogos.config
+      ANDROID_COMMON_KCFLAGS: "-D__ANDROID_COMMON_KERNEL__"
 
     steps:
-      - name: Checkout workflow repository
+      - name: Checkout kernel
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
 
       - name: Install build dependencies
+        shell: bash
         run: |
+          set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ccache curl flex git libelf-dev libssl-dev \
-            libncurses-dev lld llvm make python3 rsync unzip zip xz-utils zstd \
-            device-tree-compiler gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex git \
+            libelf-dev libssl-dev libncurses-dev \
+            python3 python-is-python3 rsync unzip zip
 
-      - name: Clone kernel source
+      - name: Use KernelSU Next pinned by this kernel tree
         shell: bash
         run: |
           set -euxo pipefail
-          rm -rf kernel
-          git init kernel
-          git -C kernel remote add origin "$KERNEL_REPO"
 
-          # GitHub's upload-pack does not treat an abbreviated commit SHA as a
-          # remote ref. Expand the known-working fogos SHA if an older workflow
-          # dispatch still sends the abbreviated value.
-          RESOLVED_KERNEL_REF="$KERNEL_REF"
-          case "$RESOLVED_KERNEL_REF" in
-            f9da9c37db69)
-              RESOLVED_KERNEL_REF="f9da9c37db694ea5af421e0bccfda6d1ec2d6e3b"
-              ;;
-          esac
+          test -d KernelSU-Next/.git -o -f KernelSU-Next/.git
+          git submodule status KernelSU-Next
 
-          echo "Requested kernel_ref: $KERNEL_REF"
-          echo "Resolved kernel_ref:  $RESOLVED_KERNEL_REF"
+          rm -rf drivers/kernelsu
+          ln -s ../KernelSU-Next/kernel drivers/kernelsu
 
-          # Full 40-char SHAs, branches and tags are accepted here. If someone
-          # supplies another abbreviated SHA, stop with a useful error instead
-          # of the misleading 'couldn't find remote ref' message.
-          if [[ "$RESOLVED_KERNEL_REF" =~ ^[0-9a-fA-F]{7,39}$ ]]; then
-            echo "::error::kernel_ref is an abbreviated SHA ($RESOLVED_KERNEL_REF). Use the full 40-character SHA."
-            exit 1
-          fi
+          test -f drivers/kernelsu/Kconfig
+          test -f drivers/kernelsu/Kbuild
 
-          git -C kernel fetch --no-tags --depth=1 origin "$RESOLVED_KERNEL_REF"
-          git -C kernel checkout --detach FETCH_HEAD
+          echo "==== KernelSU commit pinned by kernel source ===="
+          git -C KernelSU-Next rev-parse HEAD
 
-          ACTUAL_KERNEL_SHA="$(git -C kernel rev-parse HEAD)"
-          echo "Kernel source commit: $ACTUAL_KERNEL_SHA"
-
-          # Guard against accidentally building a different revision when the
-          # input was a full SHA.
-          if [[ "$RESOLVED_KERNEL_REF" =~ ^[0-9a-fA-F]{40}$ ]] && \
-             [[ "${ACTUAL_KERNEL_SHA,,}" != "${RESOLVED_KERNEL_REF,,}" ]]; then
-            echo "::error::Fetched SHA does not match requested kernel_ref."
-            exit 1
-          fi
-          grep -E '^VERSION|^PATCHLEVEL|^SUBLEVEL' kernel/Makefile | head -n 3
-
-      - name: Download Android 11 kernel toolchains
+      - name: Download stock-matching Android toolchains
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p toolchains
 
-          git clone --depth=1 \
-            https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b.git \
-            toolchains/clang
+          # fogos_stock-config was generated with Android clang r383902b1
+          # (clang 11.0.2 / build 6877366). Use that revision instead of
+          # silently moving the kernel to a newer compiler.
+          CLANG_DIR="$PWD/clang-r383902b1"
+          mkdir -p "$CLANG_DIR"
 
-          git clone --depth=1 \
+          curl -fL --retry 5 --retry-delay 3 \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-qpr3-release/clang-r383902b1.tar.gz" \
+            -o clang-r383902b1.tar.gz
+
+          tar -xzf clang-r383902b1.tar.gz -C "$CLANG_DIR"
+          rm -f clang-r383902b1.tar.gz
+
+          # Android GCC 4.9 prefixes are used only where this 5.4 tree still
+          # expects CROSS_COMPILE helpers. Do not use Ubuntu's moving GCC.
+          git clone --depth=1 -b lineage-19.1 \
             https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
-            toolchains/gcc64
-
-          git clone --depth=1 \
+            gcc-aarch64-4.9
+          git clone --depth=1 -b lineage-19.1 \
             https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git \
-            toolchains/gcc32
+            gcc-arm-4.9
 
-          test -x toolchains/clang/bin/clang
-          toolchains/clang/bin/clang --version | head -n 1
+          AARCH64_GCC="$PWD/gcc-aarch64-4.9/bin/aarch64-linux-android-"
+          ARM_GCC="$PWD/gcc-arm-4.9/bin/arm-linux-androideabi-"
 
-      - name: Replace old KSU/KernelSU-Next with official KernelSU
+          test -x "$CLANG_DIR/bin/clang"
+          test -x "${AARCH64_GCC}gcc"
+          test -x "${ARM_GCC}gcc"
+
+          echo "$CLANG_DIR/bin" >> "$GITHUB_PATH"
+          echo "CLANG_DIR=$CLANG_DIR" >> "$GITHUB_ENV"
+          echo "AARCH64_GCC=$AARCH64_GCC" >> "$GITHUB_ENV"
+          echo "ARM_GCC=$ARM_GCC" >> "$GITHUB_ENV"
+
+          "$CLANG_DIR/bin/clang" --version
+          "${AARCH64_GCC}gcc" --version | head -1
+          "${ARM_GCC}gcc" --version | head -1
+
+      - name: Fix vendor IKCONFIG
         shell: bash
-        working-directory: kernel
         run: |
           set -euxo pipefail
 
-          # Remove the KSU implementation tracked by the Motorola fork.
-          rm -rf KernelSU KernelSU-Next drivers/kernelsu
+          OLD='$(obj)/config_data: arch/arm64/configs/vendor/fogos_stock-config FORCE'
+          NEW='$(obj)/config_data: $(KCONFIG_CONFIG) FORCE'
 
-          # Clone OFFICIAL KernelSU (tiann/KernelSU), not KernelSU-Next.
-          git clone "$KSU_REPO" KernelSU
-          git -C KernelSU checkout --detach "$KSU_REF"
-          echo "KernelSU: $(git -C KernelSU describe --tags --always) @ $(git -C KernelSU rev-parse --short HEAD)"
-
-          # KernelSU >= 1.0 dropped the old non-GKI/manual-hook integration.
-          # This Linux 5.4 Motorola tree already contains the legacy hook sites,
-          # so restore the removed compatibility layer into the modern KSU tree.
-          DROP_NON_GKI=898e9d4
-          git -C KernelSU cat-file -e "${DROP_NON_GKI}^{commit}"
-          git -C KernelSU show --format= --binary "$DROP_NON_GKI" -- kernel > /tmp/drop-non-gki.patch
-
-          # Apply the inverse as a 3-way merge against v3.3.0.
-          # If upstream changed the same code incompatibly, STOP rather than
-          # silently producing a kernel with broken root.
-          if ! git -C KernelSU apply -R --3way /tmp/drop-non-gki.patch; then
-            echo "::error::KernelSU $KSU_REF changed too much for the non-GKI backport. Resolve the 898e9d4 reverse patch before flashing anything."
-            exit 1
-          fi
-          git -C KernelSU config user.name "github-actions"
-          git -C KernelSU config user.email "github-actions@users.noreply.github.com"
-          git -C KernelSU add -A
-          git -C KernelSU commit -m "Backport KernelSU non-GKI kernel support"
-
-          # Wire KernelSU as drivers/kernelsu.
-          ln -s ../KernelSU/kernel drivers/kernelsu
-          grep -q 'obj-$(CONFIG_KSU).*kernelsu/' drivers/Makefile || \
-            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
-          grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || \
-            sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-
-          # Manual-hook build: do not make CONFIG_KSU depend on KPROBES.
-          # Keep EXT4_FS dependency if present in the modern Kconfig.
-          sed -i -E 's/depends on KPROBES && EXT4_FS/depends on EXT4_FS/' KernelSU/kernel/Kconfig
-          sed -i -E 's/depends on KPROBES$/depends on EXT4_FS/' KernelSU/kernel/Kconfig
-
-      - name: Integrate SUSFS 1.5.5 for Linux 5.4
-        shell: bash
-        working-directory: kernel
-        run: |
-          set -euxo pipefail
-
-          git clone --depth=1 --branch "$SUSFS_BRANCH" "$SUSFS_REPO" susfs4ksu
-
-          SUS_VER=$(grep -E '^#define SUSFS_VERSION' susfs4ksu/kernel_patches/include/linux/susfs.h | awk '{print $3}' | tr -d '"' || true)
-          echo "SUSFS branch reports: ${SUS_VER:-unknown}"
-
-          # The fogos source used by the known-working ZIP already contains the
-          # Linux-5.4 SUSFS kernel-side integration. Refresh the implementation
-          # files from the maintained 5.4 branch. If the tree does NOT contain
-          # SUSFS yet, apply the full kernel-side patch.
-          if grep -q 'SUSFS_VERSION' include/linux/susfs.h 2>/dev/null; then
-            echo "Existing SUSFS kernel integration detected; refreshing SUSFS sources."
-            cp -f susfs4ksu/kernel_patches/fs/susfs.c fs/susfs.c
-            cp -f susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/susfs.h
-            if compgen -G 'susfs4ksu/kernel_patches/include/linux/susfs*.h' > /dev/null; then
-              cp -f susfs4ksu/kernel_patches/include/linux/susfs*.h include/linux/ || true
-            fi
+          if grep -Fq "$OLD" kernel/Makefile; then
+            sed -i 's#$(obj)/config_data: arch/arm64/configs/vendor/fogos_stock-config FORCE#$(obj)/config_data: $(KCONFIG_CONFIG) FORCE#' kernel/Makefile
+          elif grep -Fq "$NEW" kernel/Makefile; then
+            echo "IKCONFIG already fixed"
           else
-            echo "No SUSFS integration detected; applying Linux 5.4 kernel patch."
-            cp -f susfs4ksu/kernel_patches/fs/* fs/
-            cp -f susfs4ksu/kernel_patches/include/linux/* include/linux/
-            git apply --3way susfs4ksu/kernel_patches/50_add_susfs_in_kernel-5.4.patch
-          fi
-
-          # Apply the SUSFS-to-KernelSU glue. 3-way is intentional because the
-          # 5.4 SUSFS branch targets an older KSU layout while we are backporting
-          # it onto official KernelSU 3.3.0.
-          cp susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch /tmp/10_enable_susfs_for_ksu.patch
-          if ! git -C KernelSU apply --3way /tmp/10_enable_susfs_for_ksu.patch; then
-            echo "::error::SUSFS 5.4 KSU-side patch conflicts with official KernelSU $KSU_REF. Do not flash a partial build."
+            echo "ERROR: unexpected IKCONFIG rule in kernel/Makefile"
+            grep -n "config_data:" kernel/Makefile || true
             exit 1
           fi
 
-          grep -E '^#define SUSFS_VERSION' include/linux/susfs.h || true
+          grep -Fq "$NEW" kernel/Makefile
 
-      - name: Prepare fogos configuration
+      - name: Prepare strict-stock KSU config without SUSFS or OverlayFS
         shell: bash
-        working-directory: kernel
         run: |
           set -euxo pipefail
-          mkdir -p "$OUT"
 
-          cat > /tmp/g45-ksu-susfs.config <<'EOF'
-          CONFIG_KSU=y
-          # CONFIG_KSU_DEBUG is not set
+          rm -rf "${OUT_DIR}"
+          mkdir -p "${OUT_DIR}"
 
-          # Manual/non-kprobe integration for this 5.4 tree.
-          # CONFIG_KPROBES is not set
+          # -----------------------------------------------------------------
+          # 1) Limpa apenas CONFIGs duplicadas do fragmento Motorola.
+          #    Não remove drivers nem recursos específicos do aparelho.
+          # -----------------------------------------------------------------
+          CLEAN_FRAGMENT="$RUNNER_TEMP/moto-holi-fogos.clean.config"
+          python3 - "${FOGOS_FRAGMENT}" "$CLEAN_FRAGMENT" <<'PYCONFIG'
+          import re
+          import sys
+          from pathlib import Path
 
-          CONFIG_KSU_SUSFS=y
-          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
-          CONFIG_KSU_SUSFS_SUS_PATH=y
-          CONFIG_KSU_SUSFS_SUS_MOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
-          CONFIG_KSU_SUSFS_SUS_KSTAT=y
-          CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
-          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
-          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-          CONFIG_KSU_SUSFS_ENABLE_LOG=y
-          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
-          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
-          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          src = Path(sys.argv[1])
+          dst = Path(sys.argv[2])
+          lines = src.read_text(encoding="utf-8").splitlines()
 
-          # SUS_SU must be disabled when the kernel already uses KernelSU's
-          # non-kprobe/manual hook patches (upstream SUSFS requirement).
-          # CONFIG_KSU_SUSFS_SUS_SU is not set
+          pat = re.compile(r'^(?:#\s+)?CONFIG_([A-Za-z0-9_]+)(?:=|\s+is not set)')
+          seen = set()
+          kept = []
 
-          CONFIG_OVERLAY_FS=y
-          CONFIG_TMPFS_XATTR=y
-          EOF
+          for line in reversed(lines):
+              m = pat.match(line)
+              if m:
+                  sym = m.group(1)
+                  if sym in seen:
+                      continue
+                  seen.add(sym)
+              kept.append(line)
 
-          BASE1=arch/arm64/configs/vendor/genericarmv8-64_defconfig
-          BASE2=arch/arm64/configs/vendor/moto-consolidate.config
-          BASE3=arch/arm64/configs/vendor/ext_config/moto-holi.config
-          BASE4=arch/arm64/configs/vendor/ext_config/moto-holi-fogos.config
+          dst.write_text("\n".join(reversed(kept)) + "\n", encoding="utf-8")
+          PYCONFIG
 
-          for f in "$BASE1" "$BASE2" "$BASE3" "$BASE4"; do
-            test -f "$f" || { echo "::error::Missing config: $f"; exit 1; }
-          done
+          # -----------------------------------------------------------------
+          # 2) Restaura ao STOCK somente tunings que podem afetar estabilidade
+          #    global. Drivers/hardware do fragmento Motorola continuam iguais.
+          #
+          #    Isso preserva as funcionalidades do aparelho, mas evita carregar
+          #    tweaks de scheduler/rede/wakelock como parte do kernel KernelSU.
+          # -----------------------------------------------------------------
+          STABILITY_FRAGMENT="$RUNNER_TEMP/fogos.stock-stability.config"
+          python3 - "${STOCK_CONFIG}" "$STABILITY_FRAGMENT" <<'PYSTABLE'
+          import re
+          import sys
+          from pathlib import Path
 
-          ./scripts/kconfig/merge_config.sh -m -O "$OUT" \
-            "$BASE1" "$BASE2" "$BASE3" "$BASE4" /tmp/g45-ksu-susfs.config
+          stock = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+          out = Path(sys.argv[2])
 
-      - name: Finalize and verify .config
-        shell: bash
-        working-directory: kernel
-        run: |
-          set -euxo pipefail
-          export PATH="$GITHUB_WORKSPACE/toolchains/clang/bin:$GITHUB_WORKSPACE/toolchains/gcc64/bin:$GITHUB_WORKSPACE/toolchains/gcc32/bin:$PATH"
-          export CROSS_COMPILE=aarch64-linux-android-
-          export CROSS_COMPILE_ARM32=arm-linux-androideabi-
+          # Somente políticas/tunings; nenhum driver de dispositivo é alterado.
+          wanted = {
+              # timer/scheduler
+              "HZ_100", "HZ_250", "HZ_300", "HZ_1000", "HZ",
+              "UCLAMP_BUCKETS_COUNT",
+              "CPU_FREQ_DEFAULT_GOV_PERFORMANCE",
+              "CPU_FREQ_DEFAULT_GOV_POWERSAVE",
+              "CPU_FREQ_DEFAULT_GOV_USERSPACE",
+              "CPU_FREQ_DEFAULT_GOV_ONDEMAND",
+              "CPU_FREQ_DEFAULT_GOV_CONSERVATIVE",
+              "CPU_FREQ_DEFAULT_GOV_SCHEDUTIL",
 
-          make O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+              # rede: volta à política stock; não remove suporte de hardware
+              "TCP_CONG_ADVANCED",
+              "TCP_CONG_CUBIC", "TCP_CONG_RENO", "TCP_CONG_BBR", "TCP_CONG_BBR2",
+              "DEFAULT_CUBIC", "DEFAULT_RENO", "DEFAULT_BBR", "DEFAULT_BBR2",
+              "DEFAULT_TCP_CONG",
+              "NET_SCH_CAKE", "NET_SCH_DEFAULT",
 
-          echo "===== Required config ====="
-          grep -E '^(CONFIG_KSU=|CONFIG_KSU_SUSFS=|CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=|CONFIG_KSU_SUSFS_SUS_MOUNT=|CONFIG_KSU_SUSFS_SUS_KSTAT=|CONFIG_KSU_SUSFS_SUS_OVERLAYFS=|CONFIG_KSU_SUSFS_TRY_UMOUNT=|CONFIG_KSU_SUSFS_SPOOF_UNAME=|CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=|CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=|CONFIG_KSU_SUSFS_OPEN_REDIRECT=|CONFIG_OVERLAY_FS=)' "$OUT/.config" || true
+              # gerenciamento de energia/diagnóstico
+              "PM_WAKELOCKS_GC",
+              "WQ_POWER_EFFICIENT_DEFAULT",
+              "PREEMPT_NONE", "PREEMPT_VOLUNTARY", "PREEMPT",
+              "PREEMPT_COUNT", "PREEMPTION",
+              "NO_HZ", "NO_HZ_IDLE", "NO_HZ_FULL",
+              "CPU_IDLE", "CPU_IDLE_GOV_MENU", "ARM_QCOM_LPM_CPUIDLE",
+              "CPU_FREQ", "CPU_FREQ_STAT",
+              "KPROBES",
+              "KALLSYMS_ALL",
+          }
 
-          required=(
-            CONFIG_KSU=y
-            CONFIG_KSU_SUSFS=y
-            CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
-            CONFIG_KSU_SUSFS_SUS_MOUNT=y
-            CONFIG_KSU_SUSFS_SUS_KSTAT=y
-            CONFIG_KSU_SUSFS_TRY_UMOUNT=y
-          )
-          for opt in "${required[@]}"; do
-            grep -qx "$opt" "$OUT/.config" || {
-              echo "::error::Required option was lost after olddefconfig: $opt"
+          pat_set = re.compile(r'^CONFIG_([A-Za-z0-9_]+)=')
+          pat_off = re.compile(r'^# CONFIG_([A-Za-z0-9_]+) is not set$')
+
+          last = {}
+          for line in stock:
+              m = pat_set.match(line) or pat_off.match(line)
+              if m and m.group(1) in wanted:
+                  last[m.group(1)] = line
+
+          # Mantém a ordem da lista para o diff/log ser previsível.
+          lines = [last[s] for s in sorted(wanted) if s in last]
+          out.write_text("# Runtime-critical values restored from fogos_stock-config\n" +
+                         "\n".join(lines) + "\n", encoding="utf-8")
+          PYSTABLE
+
+          echo "==== Stability fragment (valores stock) ===="
+          cat "$STABILITY_FRAGMENT"
+
+          scripts/kconfig/merge_config.sh -m -O "$PWD/${OUT_DIR}" \
+            "${STOCK_CONFIG}" \
+            "$CLEAN_FRAGMENT" \
+            "$STABILITY_FRAGMENT"
+
+          # -----------------------------------------------------------------
+          # 3) Normaliza primeiro o baseline do aparelho. Assim as mudanças
+          #    seguintes ficam limitadas a KernelSU e à remoção do OverlayFS.
+          # -----------------------------------------------------------------
+          set +e
+          make O="${OUT_DIR}" \
+            ARCH=arm64 \
+            KCFLAGS="${ANDROID_COMMON_KCFLAGS}" \
+            CC="${CLANG_DIR}/bin/clang" \
+            LD="${CLANG_DIR}/bin/ld.lld" \
+            AR="${CLANG_DIR}/bin/llvm-ar" \
+            NM="${CLANG_DIR}/bin/llvm-nm" \
+            OBJCOPY="${CLANG_DIR}/bin/llvm-objcopy" \
+            OBJDUMP="${CLANG_DIR}/bin/llvm-objdump" \
+            STRIP="${CLANG_DIR}/bin/llvm-strip" \
+            CROSS_COMPILE="${AARCH64_GCC}" \
+            CROSS_COMPILE_ARM32="${ARM_GCC}" \
+            olddefconfig 2>&1 | tee config-baseline-olddefconfig.log
+          baseline_status=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$baseline_status" -ne 0 ]; then
+            echo "ERROR: baseline olddefconfig falhou com status $baseline_status"
+            tail -160 config-baseline-olddefconfig.log || true
+            exit "$baseline_status"
+          fi
+
+          cp "${OUT_DIR}/.config" baseline-fogos.config
+
+          # ================================================================
+          # KernelSU Next: mantém as funcionalidades, mas usa somente manual
+          # hook. KPROBES global NÃO é desligado; permanece no valor stock.
+          # ================================================================
+          scripts/config --file "${OUT_DIR}/.config" -e KSU
+          scripts/config --file "${OUT_DIR}/.config" -e KSU_MANUAL_HOOK
+          scripts/config --file "${OUT_DIR}/.config" -d KSU_KPROBES_HOOK
+          scripts/config --file "${OUT_DIR}/.config" -d KSU_DEBUG
+          scripts/config --file "${OUT_DIR}/.config" -d KSU_DISABLE_MANAGER
+          scripts/config --file "${OUT_DIR}/.config" -d KSU_DISABLE_POLICY
+          scripts/config --file "${OUT_DIR}/.config" -d KSU_ALLOWLIST_WORKAROUND
+
+          # ================================================================
+          # SUSFS: completamente desativado.
+          # Desabilita automaticamente qualquer CONFIG_KSU_SUSFS* presente
+          # nesta árvore para impedir que suporte SUSFS entre no kernel.
+          # ================================================================
+          while IFS= read -r sym; do
+            scripts/config --file "${OUT_DIR}/.config" -d "$sym"
+          done < <(sed -n 's/^CONFIG_\(KSU_SUSFS[A-Za-z0-9_]*\)=.*/\1/p' "${OUT_DIR}/.config" | sort -u)
+
+          # ================================================================
+          # OverlayFS: completamente fora, conforme solicitado.
+          # ================================================================
+          scripts/config --file "${OUT_DIR}/.config" -d KSU_SUSFS_SUS_OVERLAYFS
+          scripts/config --file "${OUT_DIR}/.config" -d OVERLAY_FS
+          scripts/config --file "${OUT_DIR}/.config" -d OVERLAY_FS_REDIRECT_DIR
+          scripts/config --file "${OUT_DIR}/.config" -d OVERLAY_FS_INDEX
+          scripts/config --file "${OUT_DIR}/.config" -d OVERLAY_FS_METACOPY
+          scripts/config --file "${OUT_DIR}/.config" -d OVERLAY_FS_XINO_AUTO
+
+          # IMPORTANTE: USER_NS, PID_NS, KPROBES, governador, HZ, rede etc.
+          # não são forçados aqui. Eles permanecem no baseline estável acima.
+
+          set +e
+          make O="${OUT_DIR}" \
+            ARCH=arm64 \
+            KCFLAGS="${ANDROID_COMMON_KCFLAGS}" \
+            CC="${CLANG_DIR}/bin/clang" \
+            LD="${CLANG_DIR}/bin/ld.lld" \
+            AR="${CLANG_DIR}/bin/llvm-ar" \
+            NM="${CLANG_DIR}/bin/llvm-nm" \
+            OBJCOPY="${CLANG_DIR}/bin/llvm-objcopy" \
+            OBJDUMP="${CLANG_DIR}/bin/llvm-objdump" \
+            STRIP="${CLANG_DIR}/bin/llvm-strip" \
+            CROSS_COMPILE="${AARCH64_GCC}" \
+            CROSS_COMPILE_ARM32="${ARM_GCC}" \
+            olddefconfig 2>&1 | tee config-olddefconfig.log
+          config_status=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$config_status" -ne 0 ]; then
+            echo "ERROR: olddefconfig final falhou com status $config_status"
+            tail -160 config-olddefconfig.log || true
+            exit "$config_status"
+          fi
+
+          test -s "${OUT_DIR}/.config"
+
+          require_y() {
+            grep -qx "CONFIG_$1=y" "${OUT_DIR}/.config" || {
+              echo "ERROR: CONFIG_$1 deveria estar =y"
+              grep -E "^(CONFIG_$1=|# CONFIG_$1 is not set)" "${OUT_DIR}/.config" || true
               exit 1
             }
+          }
+
+          require_off() {
+            if grep -Eq "^CONFIG_$1=(y|m)$" "${OUT_DIR}/.config"; then
+              echo "ERROR: CONFIG_$1 deveria estar desativado"
+              grep -E "^(CONFIG_$1=|# CONFIG_$1 is not set)" "${OUT_DIR}/.config" || true
+              exit 1
+            fi
+          }
+
+          echo "==== Verificação das funcionalidades KernelSU ===="
+          for opt in KSU KSU_MANUAL_HOOK; do
+            require_y "$opt"
           done
 
-          grep -qx '# CONFIG_KPROBES is not set' "$OUT/.config" || {
-            echo "::warning::KPROBES ended up enabled. This workflow is intended for the fogos manual-hook path."
+          echo "==== Verificação do que deve permanecer OFF ===="
+          for opt in \
+            KSU_KPROBES_HOOK KSU_DEBUG \
+            OVERLAY_FS OVERLAY_FS_REDIRECT_DIR OVERLAY_FS_INDEX \
+            OVERLAY_FS_METACOPY OVERLAY_FS_XINO_AUTO; do
+            require_off "$opt"
+          done
+
+          echo "==== Verificação: nenhum CONFIG_KSU_SUSFS* pode estar ativo ===="
+          if grep -Eq '^CONFIG_KSU_SUSFS[A-Za-z0-9_]*=(y|m)$' "${OUT_DIR}/.config"; then
+            echo "ERROR: suporte SUSFS ainda está ativo:"
+            grep -E '^CONFIG_KSU_SUSFS[A-Za-z0-9_]*=(y|m)$' "${OUT_DIR}/.config" || true
+            exit 1
+          fi
+          grep -E '^(CONFIG_KSU_SUSFS|# CONFIG_KSU_SUSFS)' "${OUT_DIR}/.config" || true
+
+          # -----------------------------------------------------------------
+          # 4) Confere que os tunings de estabilidade realmente ficaram iguais
+          #    ao stock depois do olddefconfig final.
+          # -----------------------------------------------------------------
+          python3 - "${STOCK_CONFIG}" "${OUT_DIR}/.config" <<'PYCHECK'
+          import re
+          import sys
+          from pathlib import Path
+
+          symbols = {
+              "HZ_100", "HZ_250", "HZ_300", "HZ_1000", "HZ",
+              "UCLAMP_BUCKETS_COUNT",
+              "CPU_FREQ_DEFAULT_GOV_PERFORMANCE",
+              "CPU_FREQ_DEFAULT_GOV_POWERSAVE",
+              "CPU_FREQ_DEFAULT_GOV_USERSPACE",
+              "CPU_FREQ_DEFAULT_GOV_ONDEMAND",
+              "CPU_FREQ_DEFAULT_GOV_CONSERVATIVE",
+              "CPU_FREQ_DEFAULT_GOV_SCHEDUTIL",
+              "TCP_CONG_ADVANCED",
+              "TCP_CONG_CUBIC", "TCP_CONG_RENO", "TCP_CONG_BBR", "TCP_CONG_BBR2",
+              "DEFAULT_CUBIC", "DEFAULT_RENO", "DEFAULT_BBR", "DEFAULT_BBR2",
+              "DEFAULT_TCP_CONG",
+              "NET_SCH_CAKE", "NET_SCH_DEFAULT",
+              "PM_WAKELOCKS_GC", "WQ_POWER_EFFICIENT_DEFAULT",
+              "PREEMPT_NONE", "PREEMPT_VOLUNTARY", "PREEMPT",
+              "PREEMPT_COUNT", "PREEMPTION",
+              "NO_HZ", "NO_HZ_IDLE", "NO_HZ_FULL",
+              "CPU_IDLE", "CPU_IDLE_GOV_MENU", "ARM_QCOM_LPM_CPUIDLE",
+              "CPU_FREQ", "CPU_FREQ_STAT",
+              "KPROBES", "KALLSYMS_ALL",
           }
+
+          set_re = re.compile(r'^CONFIG_([A-Za-z0-9_]+)=(.*)$')
+          off_re = re.compile(r'^# CONFIG_([A-Za-z0-9_]+) is not set$')
+
+          def read(path):
+              vals = {}
+              for line in Path(path).read_text(encoding="utf-8").splitlines():
+                  m = set_re.match(line)
+                  if m:
+                      vals[m.group(1)] = m.group(2)
+                      continue
+                  m = off_re.match(line)
+                  if m:
+                      vals[m.group(1)] = "n"
+              return vals
+
+          stock = read(sys.argv[1])
+          final = read(sys.argv[2])
+          bad = []
+
+          for sym in sorted(symbols):
+              if sym not in stock:
+                  continue
+              sv = stock.get(sym, "n")
+              fv = final.get(sym, "n")
+              if sv != fv:
+                  bad.append((sym, sv, fv))
+
+          if bad:
+              print("ERROR: tunings de estabilidade divergiram do stock:")
+              for sym, sv, fv in bad:
+                  print(f"  CONFIG_{sym}: stock={sv!r} final={fv!r}")
+              raise SystemExit(1)
+
+          print("OK: scheduler/rede/wakelock/KPROBES permanecem nos valores stock.")
+          PYCHECK
+
+          # -----------------------------------------------------------------
+          # 5) Regra mais importante da v11:
+          #    fora de KernelSU e da remoção deliberada do OverlayFS,
+          #    o olddefconfig final não pode alterar nenhuma CONFIG em relação
+          #    ao baseline. Se uma dependência inesperada mudar, o build para.
+          # -----------------------------------------------------------------
+          python3 - baseline-fogos.config "${OUT_DIR}/.config" <<'PYDRIFT'
+          import re
+          import sys
+          from pathlib import Path
+
+          set_re = re.compile(r'^CONFIG_([A-Za-z0-9_]+)=(.*)$')
+          off_re = re.compile(r'^# CONFIG_([A-Za-z0-9_]+) is not set$')
+
+          def read(path):
+              vals = {}
+              for line in Path(path).read_text(encoding="utf-8").splitlines():
+                  m = set_re.match(line)
+                  if m:
+                      vals[m.group(1)] = m.group(2)
+                      continue
+                  m = off_re.match(line)
+                  if m:
+                      vals[m.group(1)] = "n"
+              return vals
+
+          before = read(sys.argv[1])
+          after = read(sys.argv[2])
+
+          # KernelSU é a funcionalidade solicitada. OverlayFS permanece
+          # intencionalmente removido neste perfil.
+          allowed_exact = {
+              "OVERLAY_FS",
+              "OVERLAY_FS_REDIRECT_DIR",
+              "OVERLAY_FS_INDEX",
+              "OVERLAY_FS_METACOPY",
+              "OVERLAY_FS_XINO_AUTO",
+          }
+
+          changed = []
+          for sym in sorted(set(before) | set(after)):
+              bv = before.get(sym, "n")
+              av = after.get(sym, "n")
+              if bv == av:
+                  continue
+              if sym.startswith("KSU_SUSFS"):
+                  # SUSFS só pode mudar no sentido de ficar desativado.
+                  if av == "n":
+                      continue
+                  changed.append((sym, bv, av))
+                  continue
+              if sym.startswith("KSU") or sym in allowed_exact:
+                  continue
+              changed.append((sym, bv, av))
+
+          if changed:
+              print("ERROR: KernelSU causou alteração inesperada fora da whitelist:")
+              for sym, bv, av in changed[:120]:
+                  print(f"  CONFIG_{sym}: baseline={bv!r} final={av!r}")
+              raise SystemExit(1)
+
+          print("OK: nenhuma funcionalidade/config global mudou fora de KernelSU/OverlayFS; SUSFS está desativado.")
+          PYDRIFT
+
+          echo "==== Resumo final ===="
+          grep -E '^(CONFIG_KSU=|CONFIG_KSU_MANUAL_HOOK=|CONFIG_KPROBES=|CONFIG_HZ=|CONFIG_DEFAULT_TCP_CONG=|CONFIG_UCLAMP_BUCKETS_COUNT=|# CONFIG_OVERLAY_FS is not set|# CONFIG_KSU_SUSFS)' "${OUT_DIR}/.config" || true
+
+          echo "==== Diff baseline -> KernelSU final (informativo) ===="
+          diff -u baseline-fogos.config "${OUT_DIR}/.config" > config-ksu.diff || true
+          grep -E '^[+-](CONFIG_|# CONFIG_)' config-ksu.diff | head -200 || true
 
       - name: Build kernel Image
         shell: bash
-        working-directory: kernel
         run: |
-          set -euxo pipefail
-          export PATH="$GITHUB_WORKSPACE/toolchains/clang/bin:$GITHUB_WORKSPACE/toolchains/gcc64/bin:$GITHUB_WORKSPACE/toolchains/gcc32/bin:$PATH"
-          export CROSS_COMPILE=aarch64-linux-android-
-          export CROSS_COMPILE_ARM32=arm-linux-androideabi-
-          export CLANG_TRIPLE=aarch64-linux-gnu-
-          export KBUILD_BUILD_USER=github-actions
-          export KBUILD_BUILD_HOST=kernel-g45
-          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
-          ccache -M 2G
+          set +e
+          set -o pipefail
 
-          make -j"$(nproc)" \
-            O="$OUT" \
+          make -j"$(nproc)" O="${OUT_DIR}" \
             ARCH=arm64 \
-            LLVM=1 LLVM_IAS=1 \
-            CC="ccache clang" \
-            Image
+            LLVM=1 \
+            LLVM_IAS=1 \
+            KCFLAGS="${ANDROID_COMMON_KCFLAGS}" \
+            CC="${CLANG_DIR}/bin/clang" \
+            LD="${CLANG_DIR}/bin/ld.lld" \
+            AR="${CLANG_DIR}/bin/llvm-ar" \
+            NM="${CLANG_DIR}/bin/llvm-nm" \
+            OBJCOPY="${CLANG_DIR}/bin/llvm-objcopy" \
+            OBJDUMP="${CLANG_DIR}/bin/llvm-objdump" \
+            STRIP="${CLANG_DIR}/bin/llvm-strip" \
+            CROSS_COMPILE="${AARCH64_GCC}" \
+            CROSS_COMPILE_ARM32="${ARM_GCC}" \
+            Image 2>&1 | tee build.log
 
-          test -s "$OUT/arch/arm64/boot/Image"
-          file "$OUT/arch/arm64/boot/Image"
-          sha256sum "$OUT/arch/arm64/boot/Image" | tee "$GITHUB_WORKSPACE/Image.sha256"
+          status=${PIPESTATUS[0]}
+          set -e
 
-      - name: Package flashable AnyKernel3 ZIP
+          if [ "$status" -ne 0 ]; then
+            grep -nEi 'error:|fatal:|undefined|No rule|BUG:' build.log | head -80 || true
+            exit "$status"
+          fi
+
+          test -s "${OUT_DIR}/arch/arm64/boot/Image"
+
+      - name: Package AnyKernel3 - KSU Max Stability - No SUSFS
         shell: bash
         run: |
           set -euxo pipefail
+
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
-          rm -rf AnyKernel3/.git AnyKernel3/.github
+          cd AnyKernel3
 
-          cp kernel/out/arch/arm64/boot/Image AnyKernel3/Image
+          rm -rf .git
+          cp "../${OUT_DIR}/arch/arm64/boot/Image" ./Image
 
-          cat > AnyKernel3/anykernel.sh <<'EOF'
-          # AnyKernel3 Ramdisk Mod Script
-          # osm0sis @ xda-developers
+          cat > anykernel.sh <<'AKSCRIPT'
+          # AnyKernel3 - fogos - KernelSU Next - No SUSFS - Strict Stock Stability - No OverlayFS
 
           properties() { '
-          kernel.string=G45 KernelSU 3.3.0 + SUSFS 1.5.5
-          do.devicecheck=0
+          kernel.string=fogos 5.4.302 - KSU Next - No SUSFS - Strict Stock Stability - No OverlayFS
+          do.devicecheck=1
           do.modules=0
-          do.systemless=0
+          do.systemless=1
           do.cleanup=1
           do.cleanuponabort=0
-          device.name1=
-          device.name2=
-          device.name3=
-          device.name4=
-          device.name5=
-          supported.versions=
-          supported.patchlevels=
+          device.name1=fogos
           '; }
 
           BLOCK=boot;
@@ -341,62 +548,50 @@ jobs:
 
           . tools/ak3-core.sh;
 
-          dump_boot;
-          write_boot;
-          EOF
+          # Limpa somente artefatos das versões antigas de overlay deste projeto.
+          # Não altera outros módulos KernelSU nem dados do usuário.
+          cleanup_old_dynamic_overlay() {
+            ui_print " "
+            ui_print "Limpando artefatos antigos de overlay..."
 
-          cd AnyKernel3
-          zip -r9 ../G45-KernelSU-${KSU_REF}-SUSFS-1.5.5.zip . \
+            if [ -d /data/adb ]; then
+              rm -f /data/adb/post-fs-data.d/00-dynamic-overlay.sh 2>/dev/null || true
+              rm -f /data/adb/service.d/99-dynamic-overlay.sh 2>/dev/null || true
+              rm -rf /data/adb/modules/fogos_dynamic_bin 2>/dev/null || true
+              rm -rf /data/adb/modules_update/fogos_dynamic_bin 2>/dev/null || true
+
+              if [ -d /data/adb/overlay ]; then
+                ui_print "Backup antigo em /data/adb/overlay preservado e inativo."
+              fi
+            else
+              ui_print "/data/adb indisponivel; nada para limpar."
+            fi
+          }
+
+          split_boot;
+          flash_boot;
+          cleanup_old_dynamic_overlay;
+          AKSCRIPT
+
+          zip -r9 "../fogos-5.4.302-ksu-no-susfs-strict-stock-no-overlay-v11.0.zip" . \
             -x '*.git*' 'README.md' '*placeholder'
+
           cd ..
+          echo "=== ZIP criado ==="
+          unzip -l fogos-5.4.302-ksu-no-susfs-strict-stock-no-overlay-v11.0.zip | head -30
+          sha256sum fogos-5.4.302-ksu-no-susfs-strict-stock-no-overlay-v11.0.zip
 
-          sha256sum G45-KernelSU-${KSU_REF}-SUSFS-1.5.5.zip | tee G45-KernelSU-${KSU_REF}-SUSFS-1.5.5.zip.sha256
-
-      - name: Save build metadata
-        if: always()
-        shell: bash
-        run: |
-          {
-            echo "kernel_repo=$KERNEL_REPO"
-            echo "kernel_ref=$KERNEL_REF"
-            if [ -d kernel/.git ]; then echo "kernel_commit=$(git -C kernel rev-parse HEAD)"; fi
-            echo "ksu_repo=$KSU_REPO"
-            echo "ksu_ref=$KSU_REF"
-            if [ -d kernel/KernelSU/.git ]; then echo "ksu_commit=$(git -C kernel/KernelSU rev-parse HEAD)"; fi
-            echo "susfs_repo=$SUSFS_REPO"
-            echo "susfs_branch=$SUSFS_BRANCH"
-            if [ -f kernel/include/linux/susfs.h ]; then grep -E '^#define SUSFS_VERSION' kernel/include/linux/susfs.h || true; fi
-          } | tee build-info.txt
-
-          if [ -f kernel/out/.config ]; then
-            cp kernel/out/.config kernel-config.txt
-          fi
-
-      - name: Upload flashable ZIP
+      - name: Upload artifacts
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: G45-KernelSU-${{ inputs.ksu_ref }}-SUSFS
+          name: fogos-ksu-no-susfs-strict-stock-no-overlay-v11.0
           path: |
-            G45-KernelSU-${{ inputs.ksu_ref }}-SUSFS-1.5.5.zip
-            G45-KernelSU-${{ inputs.ksu_ref }}-SUSFS-1.5.5.zip.sha256
-            Image.sha256
-            build-info.txt
-            kernel-config.txt
-          if-no-files-found: error
-          compression-level: 0
+            fogos-5.4.302-ksu-no-susfs-strict-stock-no-overlay-v11.0.zip
+            out/.config
+            baseline-fogos.config
+            config-baseline-olddefconfig.log
+            config-olddefconfig.log
+            config-ksu.diff
+            build.log
           retention-days: 14
-
-      - name: Upload diagnostics on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: G45-build-diagnostics
-          path: |
-            build-info.txt
-            kernel-config.txt
-            kernel/KernelSU/*.rej
-            kernel/KernelSU/kernel/*.rej
-            kernel/*.rej
-          if-no-files-found: ignore
-          retention-days: 7
