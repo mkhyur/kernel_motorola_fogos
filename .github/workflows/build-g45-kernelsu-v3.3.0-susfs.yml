@@ -1,4 +1,4 @@
-name: Build fogos - KSUN + SUSFS + MetaModule SAFE
+name: Build fogos - KSUN + SUSFS + MetaModule PREINTEGRATED
 
 on:
   workflow_dispatch:
@@ -12,28 +12,20 @@ jobs:
       ARCH: arm64
       SUBARCH: arm64
       OUT: out
-
       STOCK_CONFIG: arch/arm64/configs/vendor/fogos_stock-config
       FOGOS_CONFIG: arch/arm64/configs/vendor/ext_config/moto-holi-fogos.config
-
-      # Official KernelSU Next.
-      KSU_REPO: https://github.com/KernelSU-Next/KernelSU-Next.git
-      KSU_REF: legacy
-
-      # SUSFS kernel 5.4 upstream.
-      SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
-      SUSFS_REF: kernel-5.4
-
       CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-qpr3-release/clang-r383902b1.tar.gz
 
     steps:
-      - name: Checkout fogos
+      - name: Checkout fogos 15.0-302 with SUSFS
         uses: actions/checkout@v4
         with:
+          repository: prabhatkrmishra/kernel_motorola_fogos
+          ref: 15.0-302
           fetch-depth: 1
-          submodules: false
+          submodules: recursive
 
-      - name: Build kernel and AnyKernel3
+      - name: Build and package
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -43,139 +35,78 @@ jobs:
           info() { echo "[INFO] $*"; }
           die()  { echo "::error::$*"; exit 1; }
 
-          echo "================================================"
-          echo "  fogos 5.4 - KernelSU Next + SUSFS + MetaModule"
-          echo "================================================"
+          echo "=============================================================="
+          echo " fogos 15.0-302 - PREINTEGRATED KSUN + SUSFS + MetaModule"
+          echo "=============================================================="
 
-          # ============================================================
-          # 1) Dependencies
-          # ============================================================
+          # ------------------------------------------------------------
+          # Dependencies
+          # ------------------------------------------------------------
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
-            bc bison build-essential curl flex git patch \
+            bc bison build-essential curl flex git \
             libelf-dev libssl-dev libncurses-dev \
             python3 unzip zip \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
-          ok "Dependências instaladas"
+          ok "Dependências"
 
-          # ============================================================
-          # 2) Validate Motorola fogos source
-          # ============================================================
-          [ -f "${STOCK_CONFIG}" ] || die "Não encontrei ${STOCK_CONFIG}"
-          ok "${STOCK_CONFIG}"
+          # ------------------------------------------------------------
+          # Validate exact fogos tree
+          # ------------------------------------------------------------
+          [ -f "${STOCK_CONFIG}" ] || die "Ausente: ${STOCK_CONFIG}"
+          [ -f "${FOGOS_CONFIG}" ] || die "Ausente: ${FOGOS_CONFIG}"
+          [ -f fs/susfs.c ] || die "A árvore selecionada não contém fs/susfs.c"
+          [ -f include/linux/susfs.h ] || die "A árvore selecionada não contém include/linux/susfs.h"
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || \
+            die "drivers/Kconfig não referencia KernelSU"
+          grep -q 'CONFIG_KSU' drivers/Makefile || \
+            die "drivers/Makefile não referencia KernelSU"
 
-          [ -f "${FOGOS_CONFIG}" ] || die "Não encontrei ${FOGOS_CONFIG}"
-          ok "${FOGOS_CONFIG}"
+          ok "SUSFS já integrado na árvore"
 
-          [ -f Makefile ] || die "Makefile principal do kernel não encontrado"
-          [ -d arch/arm64 ] || die "arch/arm64 não encontrado"
-          [ -f scripts/config ] || die "scripts/config não encontrado"
+          # ------------------------------------------------------------
+          # Use the KernelSU Next version pinned by the kernel tree.
+          # Do NOT replace it with another branch/tag: this prevents
+          # SUSFS/KSU source-version mismatch.
+          # ------------------------------------------------------------
+          [ -d KernelSU-Next ] || die "Submódulo KernelSU-Next não foi baixado"
+          [ -f KernelSU-Next/kernel/Kconfig ] || die "KernelSU-Next/kernel/Kconfig ausente"
+          [ -f KernelSU-Next/kernel/Kbuild ] || die "KernelSU-Next/kernel/Kbuild ausente"
 
-          # ============================================================
-          # 3) KernelSU Next official
-          # ============================================================
-          rm -rf KernelSU-Next drivers/kernelsu
+          echo "KernelSU Next pin:"
+          git -C KernelSU-Next rev-parse --short HEAD
+          git -C KernelSU-Next log -1 --oneline || true
 
-          info "Verificando branch KernelSU Next: ${KSU_REF}"
-          if ! git ls-remote --exit-code --heads "${KSU_REPO}" "${KSU_REF}" >/dev/null 2>&1; then
-            die "Branch ${KSU_REF} não existe em ${KSU_REPO}"
-          fi
-
-          git clone --depth=1 --single-branch --branch "${KSU_REF}" \
-            "${KSU_REPO}" KernelSU-Next
-
-          [ -d KernelSU-Next/.git ] || \
-            die "Clone do KernelSU Next falhou"
-
-          [ -f KernelSU-Next/kernel/Kconfig ] || \
-            die "KernelSU Next kernel/Kconfig não encontrado"
-
-          [ -f KernelSU-Next/kernel/Kbuild ] || \
-            die "KernelSU Next kernel/Kbuild não encontrado"
-
+          rm -rf drivers/kernelsu
           ln -s ../KernelSU-Next/kernel drivers/kernelsu
 
-          ok "KernelSU Next oficial instalado"
-          git -C KernelSU-Next log -1 --oneline
+          [ -f drivers/kernelsu/Kconfig ] || die "Symlink KernelSU inválido"
+          ok "KernelSU Next integrado"
 
-          # ============================================================
-          # 4) SUSFS 5.4
-          #
-          # If the fogos tree already contains SUSFS, use it.
-          # Otherwise apply upstream SUSFS kernel-5.4.
-          # ============================================================
-          SUSFS_READY=0
-
-          if [ -f fs/susfs.c ] && \
-             [ -f include/linux/susfs.h ] && \
-             grep -Rqs "SUSFS" fs/Kconfig && \
-             grep -Rqs "susfs" fs/Makefile; then
-            SUSFS_READY=1
-            ok "A árvore fogos já possui SUSFS"
-          fi
-
-          if [ "${SUSFS_READY}" -eq 0 ]; then
-            info "SUSFS não existe na árvore; integrando upstream kernel-5.4"
-
-            rm -rf susfs4ksu
-            git clone --depth=1 --branch "${SUSFS_REF}" \
-              "${SUSFS_REPO}" susfs4ksu
-
-            [ -f susfs4ksu/kernel_patches/fs/susfs.c ] || \
-              die "susfs.c não encontrado no SUSFS upstream"
-
-            [ -f susfs4ksu/kernel_patches/include/linux/susfs.h ] || \
-              die "susfs.h não encontrado no SUSFS upstream"
-
-            cp -f susfs4ksu/kernel_patches/fs/susfs.c fs/susfs.c
-            cp -f susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/susfs.h
-
-            SUSFS_KERNEL_PATCH="susfs4ksu/kernel_patches/50_add_susfs_in_kernel-5.4.patch"
-
-            [ -f "${SUSFS_KERNEL_PATCH}" ] || \
-              die "Patch SUSFS 5.4 não encontrado: ${SUSFS_KERNEL_PATCH}"
-
-            if patch --dry-run -p1 < "${SUSFS_KERNEL_PATCH}" >/dev/null 2>&1; then
-              patch -p1 < "${SUSFS_KERNEL_PATCH}"
-              ok "Patch SUSFS kernel-5.4 aplicado"
-            else
-              die "O patch SUSFS 5.4 não aplica limpo nesta árvore fogos. Build interrompido para evitar kernel parcialmente patchado."
-            fi
-          fi
-
-          [ -f fs/susfs.c ] || die "fs/susfs.c ausente após integração"
-          [ -f include/linux/susfs.h ] || die "include/linux/susfs.h ausente após integração"
-          grep -Rqs "SUSFS" fs/Kconfig || die "SUSFS não entrou em fs/Kconfig"
-          grep -Rqs "susfs" fs/Makefile || die "SUSFS não entrou em fs/Makefile"
-
-          ok "SUSFS kernel-side validado"
-
-          # ============================================================
-          # 5) Toolchain
-          # ============================================================
+          # ------------------------------------------------------------
+          # Toolchain known for this Motorola 5.4 generation
+          # ------------------------------------------------------------
           rm -rf clang clang.tar.gz
           mkdir -p clang
 
           curl -fL --retry 5 --retry-delay 3 \
             "${CLANG_URL}" -o clang.tar.gz
-
           tar -xzf clang.tar.gz -C clang
           rm -f clang.tar.gz
 
           export PATH="$PWD/clang/bin:$PATH"
 
-          command -v clang >/dev/null || die "clang não encontrado"
-          command -v ld.lld >/dev/null || die "ld.lld não encontrado"
-          command -v aarch64-linux-gnu-gcc >/dev/null || die "GCC arm64 não encontrado"
-          command -v arm-linux-gnueabi-gcc >/dev/null || die "GCC arm32 não encontrado"
+          command -v clang >/dev/null || die "clang ausente"
+          command -v ld.lld >/dev/null || die "ld.lld ausente"
+          command -v aarch64-linux-gnu-gcc >/dev/null || die "cross GCC arm64 ausente"
+          command -v arm-linux-gnueabi-gcc >/dev/null || die "cross GCC arm32 ausente"
 
           clang --version | head -1
-          ok "Toolchain pronta"
 
-          # ============================================================
-          # 6) Motorola IKCONFIG fix
-          # ============================================================
+          # ------------------------------------------------------------
+          # IKCONFIG vendor fix, only if exact Motorola rule is present.
+          # ------------------------------------------------------------
           OLD_IK='$(obj)/config_data: arch/arm64/configs/vendor/fogos_stock-config FORCE'
           NEW_IK='$(obj)/config_data: $(KCONFIG_CONFIG) FORCE'
 
@@ -183,16 +114,16 @@ jobs:
             sed -i \
               's#$(obj)/config_data: arch/arm64/configs/vendor/fogos_stock-config FORCE#$(obj)/config_data: $(KCONFIG_CONFIG) FORCE#' \
               kernel/Makefile
-            ok "IKCONFIG Motorola corrigido"
+            ok "IKCONFIG corrigido"
           elif grep -Fq "${NEW_IK}" kernel/Makefile; then
-            ok "IKCONFIG já estava corrigido"
+            ok "IKCONFIG já correto"
           else
-            info "Regra IKCONFIG customizada não encontrada; seguindo sem alterar"
+            info "Regra IKCONFIG específica não encontrada; nenhuma alteração feita"
           fi
 
-          # ============================================================
-          # 7) Clean Motorola config fragment
-          # ============================================================
+          # ------------------------------------------------------------
+          # Clean duplicate entries from Motorola device fragment
+          # ------------------------------------------------------------
           rm -rf "${OUT}"
           mkdir -p "${OUT}"
 
@@ -206,25 +137,24 @@ jobs:
 
           rx = re.compile(r'^(?:#\s*)?CONFIG_([A-Za-z0-9_]+)(?:=|\s+is not set)')
           seen = set()
-          out = []
+          result = []
 
           for line in reversed(src):
               m = rx.match(line)
               if m:
-                  sym = m.group(1)
-                  if sym in seen:
+                  symbol = m.group(1)
+                  if symbol in seen:
                       continue
-                  seen.add(sym)
-              out.append(line)
+                  seen.add(symbol)
+              result.append(line)
 
-          dst.write_text("\n".join(reversed(out)) + "\n")
+          dst.write_text("\n".join(reversed(result)) + "\n")
           PY
 
           scripts/kconfig/merge_config.sh -m -O "$PWD/${OUT}" \
             "${STOCK_CONFIG}" \
             "$RUNNER_TEMP/fogos-clean.config"
 
-          # Resolve baseline once before forcing KSUN/SUSFS settings.
           make O="${OUT}" \
             ARCH=arm64 \
             CC=clang \
@@ -238,92 +168,64 @@ jobs:
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             olddefconfig
 
-          # ============================================================
-          # 8) KernelSU Next + SUSFS + MetaModule requirements
-          # ============================================================
+          # ------------------------------------------------------------
+          # Required features
+          # ------------------------------------------------------------
           scripts/config --file "${OUT}/.config" -e KSU
-          scripts/config --file "${OUT}/.config" -e KSU_MANUAL_HOOK
-          scripts/config --file "${OUT}/.config" -d KSU_KPROBES_HOOK
+
+          # Prefer manual hooks for this legacy 5.4 tree.
+          if grep -Rqs 'config KSU_MANUAL_HOOK' KernelSU-Next/kernel; then
+            scripts/config --file "${OUT}/.config" -e KSU_MANUAL_HOOK
+          fi
+
+          if grep -Rqs 'config KSU_KPROBES_HOOK' KernelSU-Next/kernel; then
+            scripts/config --file "${OUT}/.config" -d KSU_KPROBES_HOOK
+          fi
 
           scripts/config --file "${OUT}/.config" -e KSU_SUSFS
 
-          # Systemless / metamodule prerequisites.
+          # MetaModule / mount prerequisites.
           scripts/config --file "${OUT}/.config" -e NAMESPACES
           scripts/config --file "${OUT}/.config" -e PID_NS
           scripts/config --file "${OUT}/.config" -e IPC_NS
           scripts/config --file "${OUT}/.config" -e UTS_NS
           scripts/config --file "${OUT}/.config" -e NET_NS
-
           scripts/config --file "${OUT}/.config" -e TMPFS
           scripts/config --file "${OUT}/.config" -e TMPFS_XATTR
           scripts/config --file "${OUT}/.config" -e TMPFS_POSIX_ACL
-
-          # Needed by overlayfs-based Meta Modules.
           scripts/config --file "${OUT}/.config" -e OVERLAY_FS
 
-          # Enable SUSFS features exposed by the exact source,
-          # except known high-risk options for non-GKI.
-          python3 - "${OUT}/.config" <<'PY'
-          import re
-          import subprocess
-          import sys
-          from pathlib import Path
-
-          config = sys.argv[1]
-          symbols = set()
-
-          roots = [Path("KernelSU-Next/kernel"), Path("fs/Kconfig")]
-
-          for root in roots:
-              files = [root] if root.is_file() else list(root.rglob("*"))
-              for p in files:
-                  if not p.is_file():
-                      continue
-                  try:
-                      text = p.read_text(errors="ignore")
-                  except Exception:
-                      continue
-
-                  symbols.update(
-                      re.findall(
-                          r'^\s*config\s+(KSU_SUSFS(?:_[A-Za-z0-9_]+)?)\s*$',
-                          text,
-                          re.M,
-                      )
-                  )
-
-          symbols.discard("KSU_SUSFS")
-
-          # Upstream SUSFS warns that mnt_id_reorder may bootloop on non-GKI.
-          blocked = {
-              "KSU_SUSFS_MNT_ID_REORDER",
-              "KSU_SUSFS_MNT_ID_REORDER_DEFAULT",
+          # Enable stable SUSFS options that actually exist in this tree.
+          enable_if_exists() {
+            local sym="$1"
+            if grep -Rqs "config ${sym}" KernelSU-Next/kernel fs/Kconfig; then
+              scripts/config --file "${OUT}/.config" -e "${sym}"
+              echo "[ON] CONFIG_${sym}"
+            fi
           }
 
-          print("SUSFS options:")
-          for sym in sorted(symbols):
-              if sym in blocked or "MNT_ID_REORDER" in sym:
-                  print(f"  [SAFE-OFF] CONFIG_{sym}")
-                  subprocess.run(
-                      ["scripts/config", "--file", config, "-d", sym],
-                      check=False,
-                  )
-              else:
-                  print(f"  [ON] CONFIG_{sym}")
-                  subprocess.run(
-                      ["scripts/config", "--file", config, "-e", sym],
-                      check=True,
-                  )
-          PY
+          disable_if_exists() {
+            local sym="$1"
+            if grep -Rqs "config ${sym}" KernelSU-Next/kernel fs/Kconfig; then
+              scripts/config --file "${OUT}/.config" -d "${sym}"
+              echo "[OFF] CONFIG_${sym}"
+            fi
+          }
 
-          # Explicitly disable any mnt_id_reorder symbol that exists.
-          for sym in \
-            KSU_SUSFS_MNT_ID_REORDER \
-            KSU_SUSFS_MNT_ID_REORDER_DEFAULT; do
-            scripts/config --file "${OUT}/.config" -d "${sym}" || true
-          done
+          enable_if_exists KSU_SUSFS_HAS_MAGIC_MOUNT
+          enable_if_exists KSU_SUSFS_SUS_PATH
+          enable_if_exists KSU_SUSFS_SUS_MOUNT
+          enable_if_exists KSU_SUSFS_SUS_KSTAT
+          enable_if_exists KSU_SUSFS_TRY_UMOUNT
+          enable_if_exists KSU_SUSFS_SPOOF_UNAME
+          enable_if_exists KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          enable_if_exists KSU_SUSFS_OPEN_REDIRECT
+          enable_if_exists KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
 
-          # Final Kconfig dependency resolution.
+          # Known unsafe choice on non-GKI.
+          disable_if_exists KSU_SUSFS_MNT_ID_REORDER
+          disable_if_exists KSU_SUSFS_MNT_ID_REORDER_DEFAULT
+
           make O="${OUT}" \
             ARCH=arm64 \
             CC=clang \
@@ -337,44 +239,38 @@ jobs:
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             olddefconfig
 
-          # ============================================================
-          # 9) Strict pre-build validation
-          # ============================================================
           require_y() {
             grep -qx "CONFIG_$1=y" "${OUT}/.config" || \
-              die "CONFIG_$1 não ficou =y"
+              die "CONFIG_$1 não ficou =y depois do olddefconfig"
             ok "CONFIG_$1=y"
           }
 
-          require_not_y() {
-            if grep -qx "CONFIG_$1=y" "${OUT}/.config"; then
-              die "CONFIG_$1 ficou =y mas deveria estar desativado"
-            fi
-            ok "CONFIG_$1 desativado"
-          }
-
           require_y KSU
-          require_y KSU_MANUAL_HOOK
           require_y KSU_SUSFS
           require_y NAMESPACES
           require_y TMPFS
           require_y OVERLAY_FS
 
-          # Boot-safety choice for this non-GKI kernel.
-          require_not_y KSU_SUSFS_MNT_ID_REORDER || true
+          if grep -Rqs 'config KSU_MANUAL_HOOK' KernelSU-Next/kernel; then
+            require_y KSU_MANUAL_HOOK
+          fi
+
+          if grep -qx 'CONFIG_KSU_SUSFS_MNT_ID_REORDER=y' "${OUT}/.config"; then
+            die "MNT_ID_REORDER ficou ativo; build bloqueado por segurança"
+          fi
 
           cp "${OUT}/.config" fogos-final.config
 
           echo
-          echo "======== CONFIG FINAL ========"
+          echo "========== CONFIG SELECIONADA =========="
           grep -E \
             '^(CONFIG_KSU=|CONFIG_KSU_MANUAL_HOOK=|CONFIG_KSU_SUSFS|CONFIG_NAMESPACES=|CONFIG_TMPFS|CONFIG_OVERLAY_FS=|# CONFIG_KSU_SUSFS.*MNT_ID_REORDER)' \
             "${OUT}/.config" | sort || true
-          echo "=============================="
+          echo "========================================="
 
-          # ============================================================
-          # 10) Compile Image
-          # ============================================================
+          # ------------------------------------------------------------
+          # Build
+          # ------------------------------------------------------------
           set +e
           set -o pipefail
 
@@ -391,33 +287,31 @@ jobs:
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             Image 2>&1 | tee build.log
 
-          BUILD_STATUS=${PIPESTATUS[0]}
+          STATUS=${PIPESTATUS[0]}
           set -e
 
-          if [ "${BUILD_STATUS}" -ne 0 ]; then
+          if [ "${STATUS}" -ne 0 ]; then
             echo
-            echo "======== ERROS DE COMPILAÇÃO ========"
+            echo "========== ERROS =========="
             grep -nEi \
               'error:|fatal:|undefined reference|No rule to make target|Stop\.' \
-              build.log | tail -120 || true
-            echo "====================================="
-            exit "${BUILD_STATUS}"
+              build.log | tail -150 || true
+            echo "==========================="
+            exit "${STATUS}"
           fi
 
           IMAGE="${OUT}/arch/arm64/boot/Image"
-          [ -s "${IMAGE}" ] || die "Build terminou mas Image não foi criada"
+          [ -s "${IMAGE}" ] || die "Image não foi criada"
 
-          ok "Kernel Image compilada"
+          ok "Image compilada"
           ls -lh "${IMAGE}"
           sha256sum "${IMAGE}"
 
-          # ============================================================
-          # 11) AnyKernel3
-          # ============================================================
+          # ------------------------------------------------------------
+          # AnyKernel3 package
+          # ------------------------------------------------------------
           rm -rf AnyKernel3
-
-          git clone --depth=1 \
-            https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
 
           rm -rf AnyKernel3/.git
           rm -f AnyKernel3/README.md
@@ -428,7 +322,7 @@ jobs:
           # KernelSU Next + SUSFS + MetaModule
 
           properties() { '
-          kernel.string=fogos KernelSU Next + SUSFS + MetaModule
+          kernel.string=fogos KSUN + SUSFS + MetaModule
           do.devicecheck=1
           do.modules=0
           do.systemless=1
@@ -450,23 +344,18 @@ jobs:
 
           chmod 755 AnyKernel3/anykernel.sh
 
+          ZIP="fogos-KSUN-SUSFS-MetaModule-PREINTEGRATED-AnyKernel3.zip"
+
           (
             cd AnyKernel3
-            zip -qr9 ../fogos-KSUN-SUSFS-MetaModule-SAFE-AnyKernel3.zip . \
+            zip -qr9 "../${ZIP}" . \
               -x '*.git*' 'README.md' '*placeholder'
           )
 
-          ZIP="fogos-KSUN-SUSFS-MetaModule-SAFE-AnyKernel3.zip"
-          [ -s "${ZIP}" ] || die "AnyKernel ZIP não foi criado"
-
+          [ -s "${ZIP}" ] || die "ZIP AnyKernel3 não foi criado"
           unzip -t "${ZIP}"
-          ok "AnyKernel ZIP validado"
 
-          echo
-          echo "============================================"
-          echo " BUILD FINALIZADO COM SUCESSO"
-          echo " ${ZIP}"
-          echo "============================================"
+          ok "ZIP validado"
           ls -lh "${ZIP}"
           sha256sum "${ZIP}"
 
@@ -474,9 +363,9 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: fogos-KSUN-SUSFS-MetaModule-SAFE
+          name: fogos-KSUN-SUSFS-MetaModule-PREINTEGRATED
           path: |
-            fogos-KSUN-SUSFS-MetaModule-SAFE-AnyKernel3.zip
+            fogos-KSUN-SUSFS-MetaModule-PREINTEGRATED-AnyKernel3.zip
             fogos-final.config
             build.log
           retention-days: 14
