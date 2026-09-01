@@ -1,4 +1,4 @@
-name: Build fogos - KernelSU Next No SUSFS
+name: Build fogos - KernelSU Next Pure
 
 on:
   workflow_dispatch:
@@ -9,21 +9,19 @@ jobs:
     timeout-minutes: 120
 
     env:
-      ARCH: arm64
       OUT: out
+      ARCH: arm64
       STOCK_CONFIG: arch/arm64/configs/vendor/fogos_stock-config
       FOGOS_CONFIG: arch/arm64/configs/vendor/ext_config/moto-holi-fogos.config
-      KSU_REPO: https://github.com/KernelSU-Next/KernelSU-Next.git
-      KSU_BRANCH: legacy
 
     steps:
-      - name: Checkout fogos kernel
+      - name: Checkout kernel
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
           submodules: recursive
+          fetch-depth: 1
 
-      - name: Install dependencies
+      - name: Dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
@@ -31,34 +29,30 @@ jobs:
             libelf-dev libssl-dev python3 unzip zip \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
-      - name: Setup KernelSU Next
-        shell: bash
+      - name: KernelSU Next
         run: |
           set -e
-
           rm -rf KernelSU-Next drivers/kernelsu
 
-          git clone --depth=1 --single-branch \
-            --branch "${KSU_BRANCH}" \
-            "${KSU_REPO}" KernelSU-Next
+          git clone --depth=1 --branch legacy \
+            https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU-Next
 
           test -f KernelSU-Next/kernel/Kconfig
           test -f KernelSU-Next/kernel/Kbuild
 
           ln -s ../KernelSU-Next/kernel drivers/kernelsu
 
-          echo "KernelSU commit:"
           git -C KernelSU-Next log -1 --oneline
 
-      - name: Install clang toolchain
-        shell: bash
+      - name: Clang toolchain
         run: |
           set -e
 
           mkdir clang
+
           curl -L \
-            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-qpr3-release/clang-r383902b1.tar.gz \
-            -o clang.tar.gz
+          https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-qpr3-release/clang-r383902b1.tar.gz \
+          -o clang.tar.gz
 
           tar -xzf clang.tar.gz -C clang
 
@@ -66,8 +60,7 @@ jobs:
 
           clang --version
 
-      - name: Configure kernel
-        shell: bash
+      - name: Configure
         run: |
           set -e
 
@@ -92,8 +85,6 @@ jobs:
           scripts/config --file "${OUT}/.config" -e KSU
           scripts/config --file "${OUT}/.config" -e KSU_MANUAL_HOOK
           scripts/config --file "${OUT}/.config" -d KSU_KPROBES_HOOK
-
-          # Remove all SUSFS support
           scripts/config --file "${OUT}/.config" -d KSU_SUSFS
 
           make O="${OUT}" \
@@ -109,14 +100,13 @@ jobs:
           grep -qx 'CONFIG_KSU=y' "${OUT}/.config"
 
           if grep -q 'CONFIG_KSU_SUSFS=y' "${OUT}/.config"; then
-            echo "ERROR: SUSFS still enabled"
+            echo "ERROR: SUSFS enabled"
             exit 1
           fi
 
           cp "${OUT}/.config" final-config
 
-      - name: Build Image
-        shell: bash
+      - name: Compile Image
         run: |
           set -e
 
@@ -133,8 +123,7 @@ jobs:
 
           test -s "${OUT}/arch/arm64/boot/Image"
 
-      - name: Create AnyKernel3 ZIP
-        shell: bash
+      - name: AnyKernel3
         run: |
           set -e
 
@@ -143,31 +132,43 @@ jobs:
 
           cp "${OUT}/arch/arm64/boot/Image" AnyKernel3/Image
 
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path("AnyKernel3/anykernel.sh")
-          s = p.read_text()
-          s = s.replace(
-              "block=/dev/block/bootdevice/by-name/boot;",
-              "BLOCK=boot;"
-          )
-          s = s.replace(
-              "is_slot_device=1;",
-              "IS_SLOT_DEVICE=auto;"
-          )
-          p.write_text(s)
-          PY
+          cat > AnyKernel3/anykernel.sh <<'AK'
+          #!/system/bin/sh
+
+          properties() { '
+          kernel.string=Motorola fogos KernelSU Next Pure
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=fogos
+          device.name2=generic
+          '; }
+
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          split_boot;
+          flash_boot;
+
+          exit 0;
+          AK
 
           chmod 755 AnyKernel3/anykernel.sh
 
           cd AnyKernel3
-          zip -r9 ../fogos-KernelSU-Next-No-SUSFS-AnyKernel3.zip . \
+          zip -r9 ../fogos-KernelSU-Next-Pure-AnyKernel3.zip . \
             -x '*.git*' README.md
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: fogos-KernelSU-Next-No-SUSFS
+          name: fogos-KernelSU-Next-Pure
           path: |
-            fogos-KernelSU-Next-No-SUSFS-AnyKernel3.zip
+            fogos-KernelSU-Next-Pure-AnyKernel3.zip
             final-config
